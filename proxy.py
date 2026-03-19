@@ -13,11 +13,13 @@ import threading
 import tempfile
 import subprocess
 import re
+import time
 from urllib.parse import urlparse, parse_qs, urlencode
 
 PORT = int(os.environ.get('PORT', 3456))
 NDK_HOST = 'ndk.cz'
 STATIC_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = '/tmp/kramerius_ocr_state.json'
 
 # Persistent session store: cookie string captured after login
 session_store = {
@@ -62,8 +64,48 @@ def fetch_ndk_data(path, cookie=''):
         headers['Cookie'] = cookie
     req = urllib.request.Request(url, headers=headers)
     ctx = ssl.create_default_context()
-    resp = urllib.request.urlopen(req, context=ctx, timeout=30)
+    resp = urllib.request.urlopen(req, context=ctx, timeout=60)
     return resp.read(), resp.headers.get('Content-Type', '')
+
+
+def fetch_ndk_retry(path, cookie='', retries=4):
+    """Fetch with exponential backoff — survives transient network drops (e.g. sleep/wake)."""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return fetch_ndk_data(path, cookie)
+        except Exception as e:
+            last_exc = e
+            if attempt < retries - 1:
+                wait = 3 * (2 ** attempt)   # 3s, 6s, 12s
+                print(f'[OCR] Fetch failed ({e}), retry {attempt+1}/{retries-1} in {wait}s...')
+                time.sleep(wait)
+    raise last_exc
+
+
+def _save_ocr_state():
+    """Persist completed job state to disk so it survives server restarts."""
+    try:
+        with ocr_lock:
+            state = dict(ocr_job)
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+
+def _load_ocr_state():
+    """Restore job state from disk on startup (only if result file still exists)."""
+    global ocr_job
+    try:
+        with open(STATE_FILE) as f:
+            state = json.load(f)
+        if state.get('status') == 'done' and state.get('result_path') and os.path.isfile(state['result_path']):
+            with ocr_lock:
+                ocr_job.update(state)
+            print(f'[OCR] Restored completed job: {state.get("title", "")}')
+    except Exception:
+        pass
 
 
 def parse_page_range(range_str, max_pages):
@@ -97,7 +139,7 @@ def run_ocr_job(uuid, fmt, page_range_str):
             cookie = session_store['cookie']
 
         # 1. Get metadata
-        meta_raw, _ = fetch_ndk_data(f'/search/api/v5.0/item/{uuid}', cookie)
+        meta_raw, _ = fetch_ndk_retry(f'/search/api/v5.0/item/{uuid}', cookie)
         meta = json.loads(meta_raw)
         title = meta.get('title', 'Unknown')
         with ocr_lock:
@@ -105,7 +147,7 @@ def run_ocr_job(uuid, fmt, page_range_str):
             ocr_job['message'] = f'Found: {title}'
 
         # 2. Get page list
-        children_raw, _ = fetch_ndk_data(f'/search/api/v5.0/item/{uuid}/children', cookie)
+        children_raw, _ = fetch_ndk_retry(f'/search/api/v5.0/item/{uuid}/children', cookie)
         pages = json.loads(children_raw)
         total = len(pages)
 
@@ -135,14 +177,14 @@ def run_ocr_job(uuid, fmt, page_range_str):
                 ocr_job['progress'] = int((i / num_pages) * 90)
                 ocr_job['message'] = f'OCR page {i+1}/{num_pages}: {label}'
 
-            # Download full image
+            # Download full image (with retry on each tier)
             try:
-                img_data, ct = fetch_ndk_data(f'/search/api/v5.0/item/{pid}/full', cookie)
+                img_data, ct = fetch_ndk_retry(f'/search/api/v5.0/item/{pid}/full', cookie)
             except Exception:
                 try:
-                    img_data, ct = fetch_ndk_data(f'/search/api/v5.0/item/{pid}/preview', cookie)
+                    img_data, ct = fetch_ndk_retry(f'/search/api/v5.0/item/{pid}/preview', cookie)
                 except Exception:
-                    img_data, ct = fetch_ndk_data(f'/search/api/v5.0/item/{pid}/thumb', cookie)
+                    img_data, ct = fetch_ndk_retry(f'/search/api/v5.0/item/{pid}/thumb', cookie)
 
             img = Image.open(io.BytesIO(img_data))
             if img.mode != 'RGB':
@@ -175,6 +217,7 @@ def run_ocr_job(uuid, fmt, page_range_str):
             ocr_job['result_path'] = out_path
             ocr_job['result_format'] = fmt
 
+        _save_ocr_state()
         print(f'[OCR] Done: {out_path}')
 
     except Exception as e:
@@ -533,6 +576,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 'status': ocr_job['status'],
                 'progress': ocr_job['progress'],
                 'message': ocr_job['message'],
+                'format': ocr_job.get('result_format', 'pdf'),
             })
 
     def _ocr_download(self):
@@ -638,6 +682,7 @@ class ThreadedHTTPServer(http.server.HTTPServer):
 
 
 if __name__ == '__main__':
+    _load_ocr_state()
     server = ThreadedHTTPServer(('', PORT), ProxyHandler)
     print(f'\n  Kramerius Debug Proxy running at http://localhost:{PORT}\n')
     print(f'  Static files: {STATIC_DIR}')

@@ -136,6 +136,10 @@
       <div class="status-area" id="statusArea">
         <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
         <div class="status-text" id="statusText">Preparing...</div>
+        <a id="downloadBtn" href="#" class="btn btn-primary"
+           style="display:none; margin-top:12px; text-align:center; text-decoration:none; background:#5cb85c">
+          ⬇ Download
+        </a>
       </div>
     </div>
 
@@ -152,6 +156,13 @@
       document.querySelectorAll('.format-option').forEach(o => o.classList.remove('selected'));
       el.classList.add('selected');
       selectedFormat = el.dataset.format;
+    }
+
+    function showDownloadButton(fmt) {
+      const btn = document.getElementById('downloadBtn');
+      btn.href = `/api/ocr/download/${fmt}`;
+      btn.textContent = `⬇ Download ${fmt.toUpperCase()}`;
+      btn.style.display = 'block';
     }
 
     function extractUuid(input) {
@@ -237,11 +248,10 @@
 
             if (s.status === 'done') {
               clearInterval(pollTimer);
-              statusText.textContent = 'Done! Downloading...';
+              statusText.textContent = 'Conversion complete!';
               statusText.className = 'status-text done';
               btn.disabled = false;
-              // Trigger download
-              window.location.href = `/api/ocr/download/${selectedFormat}`;
+              showDownloadButton(s.format || selectedFormat);
             } else if (s.status === 'error') {
               clearInterval(pollTimer);
               statusText.textContent = s.message || 'Error during conversion';
@@ -263,7 +273,7 @@
       }
     }
 
-    // Check auth on load
+    // On load: restore auth badge + any completed/running job
     (async () => {
       try {
         const resp = await fetch('/auth/status');
@@ -274,6 +284,47 @@
           badge.innerHTML = `<span class="dot"></span>${data.user.firstname} ${data.user.surname}`;
         }
       } catch (e) {}
+
+      // Restore job state
+      try {
+        const sr = await fetch('/api/ocr/status');
+        const s = await sr.json();
+        if (s.status === 'done' || s.status === 'running') {
+          const statusArea = document.getElementById('statusArea');
+          const statusText = document.getElementById('statusText');
+          const progressFill = document.getElementById('progressFill');
+          statusArea.classList.add('visible');
+          progressFill.style.width = s.progress + '%';
+          if (s.status === 'done') {
+            statusText.className = 'status-text done';
+            statusText.textContent = 'Conversion complete!';
+            showDownloadButton(s.format || 'pdf');
+          } else {
+            statusText.textContent = s.message || 'Processing...';
+            // Resume polling
+            document.getElementById('btnConvert').disabled = true;
+            pollTimer = setInterval(async () => {
+              try {
+                const r = await fetch('/api/ocr/status');
+                const j = await r.json();
+                progressFill.style.width = j.progress + '%';
+                statusText.textContent = j.message || 'Processing...';
+                if (j.status === 'done') {
+                  clearInterval(pollTimer);
+                  statusText.className = 'status-text done';
+                  statusText.textContent = 'Conversion complete!';
+                  document.getElementById('btnConvert').disabled = false;
+                  showDownloadButton(j.format || 'pdf');
+                } else if (j.status === 'error') {
+                  clearInterval(pollTimer);
+                  statusText.className = 'status-text error';
+                  document.getElementById('btnConvert').disabled = false;
+                }
+              } catch(e) { clearInterval(pollTimer); }
+            }, 1000);
+          }
+        }
+      } catch(e) {}
     })();
   </script>
 </body>
