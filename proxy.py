@@ -35,6 +35,7 @@ ocr_job = {
     'title': '',
 }
 ocr_lock = threading.Lock()
+cancel_event = threading.Event()   # set() to request cancellation
 
 MIME_TYPES = {
     '.html': 'text/html',
@@ -141,6 +142,7 @@ def parse_page_range(range_str, max_pages):
 def run_ocr_job(uuid, fmt, page_range_str):
     """Background thread: fetch pages from NDK, OCR, produce PDF or EPUB."""
     try:
+        cancel_event.clear()
         with ocr_lock:
             ocr_job['status'] = 'running'
             ocr_job['progress'] = 0
@@ -176,6 +178,14 @@ def run_ocr_job(uuid, fmt, page_range_str):
         pil_images = []
 
         for i, page_idx in enumerate(indices):
+            if cancel_event.is_set():
+                with ocr_lock:
+                    ocr_job['status'] = 'idle'
+                    ocr_job['message'] = 'Cancelled.'
+                    ocr_job['progress'] = 0
+                print('[OCR] Job cancelled by user.')
+                return
+
             page = all_pages[page_idx]
             pid = page['pid']
             label = page.get('title', f'Page {page_idx + 1}')
@@ -377,6 +387,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._auth_set_cookie_post()
         elif path == '/api/ocr/start':
             self._ocr_start()
+        elif path == '/api/ocr/cancel':
+            self._ocr_cancel()
         else:
             self.send_error(404)
 
@@ -539,6 +551,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         t = threading.Thread(target=run_ocr_job, args=(uuid, fmt, pages), daemon=True)
         t.start()
         self._json_response({'ok': True, 'message': 'OCR job started'})
+
+    def _ocr_cancel(self):
+        with ocr_lock:
+            status = ocr_job['status']
+        if status == 'running':
+            cancel_event.set()
+            print('[OCR] Cancel requested.')
+            self._json_response({'ok': True, 'message': 'Cancellation requested'})
+        else:
+            self._json_response({'ok': False, 'message': 'No running job to cancel'})
 
     def _ocr_status(self):
         with ocr_lock:
