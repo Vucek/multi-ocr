@@ -22,11 +22,11 @@
     .field { margin-bottom: 14px; }
     .field:last-child { margin-bottom: 0; }
     .field label { display: block; font-size: 12px; font-weight: 500; color: #666; margin-bottom: 5px; }
-    .field input, .field select {
+    .field input {
       width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px;
       font-size: 14px; font-family: inherit; background: #fafafa; transition: border-color 0.2s;
     }
-    .field input:focus, .field select:focus { outline: none; border-color: #4a90d9; background: #fff; }
+    .field input:focus { outline: none; border-color: #4a90d9; background: #fff; }
     .field .hint { font-size: 11px; color: #999; margin-top: 4px; }
 
     .auth-row { display: flex; gap: 10px; }
@@ -47,13 +47,15 @@
       font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: inherit;
     }
     .btn-primary { background: #4a90d9; color: #fff; }
-    .btn-primary:hover { background: #3a7bc8; }
+    .btn-primary:hover:not(:disabled) { background: #3a7bc8; }
     .btn-primary:disabled { background: #b8d4f0; cursor: not-allowed; }
+    .btn-success { background: #5cb85c; color: #fff; margin-top: 12px; }
+    .btn-success:hover { background: #4cae4c; }
 
     .status-area { margin-top: 16px; display: none; }
     .status-area.visible { display: block; }
     .progress-track { height: 6px; background: #eee; border-radius: 3px; overflow: hidden; }
-    .progress-fill { height: 100%; background: #4a90d9; transition: width 0.3s; width: 0%; }
+    .progress-fill { height: 100%; background: #4a90d9; transition: width 0.4s; width: 0%; }
     .status-text { font-size: 12px; color: #888; margin-top: 8px; text-align: center; }
     .status-text.error { color: #d9534f; }
     .status-text.done { color: #5cb85c; }
@@ -66,9 +68,7 @@
     .auth-status.ok { background: #e8f5e9; color: #4caf50; }
     .auth-status.ok .dot { background: #4caf50; }
 
-    .footer {
-      text-align: center; margin-top: 24px; font-size: 12px; color: #bbb;
-    }
+    .footer { text-align: center; margin-top: 24px; font-size: 12px; color: #bbb; }
     .footer a { color: #4a90d9; text-decoration: none; }
     .footer a:hover { text-decoration: underline; }
   </style>
@@ -91,9 +91,10 @@
           <input id="shibsession" placeholder="_shibsession_6e64...=VALUE" />
         </div>
       </div>
-<div class="field" style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap">
+      <div class="field" style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap">
         <button class="btn btn-primary" style="width:auto; padding:8px 20px; font-size:13px" onclick="authenticate()">Connect</button>
-        <button class="btn" style="width:auto; padding:8px 16px; font-size:13px; background:#f0f0f0; color:#555; border:1px solid #ddd" onclick="window.open('https://ndk.cz/Shibboleth.sso/Login?target=https://ndk.cz/search/','_blank')">Login via eduID</button>
+        <button class="btn" style="width:auto; padding:8px 16px; font-size:13px; background:#f0f0f0; color:#555; border:1px solid #ddd"
+          onclick="window.open('https://ndk.cz/Shibboleth.sso/Login?target=https://ndk.cz/search/','_blank')">Login via eduID</button>
         <span class="hint">Copy cookies from DevTools &gt; Application &gt; Cookies &gt; ndk.cz</span>
       </div>
     </div>
@@ -103,15 +104,15 @@
       <h2>Book</h2>
       <div class="field">
         <label>NDK Book Link or UUID</label>
-        <input id="bookLink" placeholder="https://ndk.cz/view/uuid:726f8730-c0a7-11e3-aec3-005056827e52 or uuid:..." />
+        <input id="bookLink" placeholder="https://ndk.cz/view/uuid:726f8730-... or uuid:..." />
         <div class="hint">Paste the full URL from ndk.cz or just the uuid:... identifier</div>
       </div>
     </div>
 
-    <!-- Format & Download card -->
+    <!-- Format & Convert card -->
     <div class="card">
       <h2>Output Format</h2>
-      <div class="format-row" id="formatRow">
+      <div class="format-row">
         <div class="format-option selected" data-format="pdf" onclick="selectFormat(this)">
           <div class="fmt-name">PDF</div>
           <div class="fmt-desc">Searchable PDF with OCR text layer</div>
@@ -125,7 +126,7 @@
       <div style="margin-top:16px">
         <div class="field">
           <label>Page Range (optional)</label>
-          <input id="pageRange" placeholder="e.g. 1-10 or leave empty for all pages" />
+          <input id="pageRange" placeholder="e.g. 1-20  or leave empty for all pages" />
         </div>
       </div>
 
@@ -136,10 +137,9 @@
       <div class="status-area" id="statusArea">
         <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
         <div class="status-text" id="statusText">Preparing...</div>
-        <a id="downloadBtn" href="#" class="btn btn-primary"
-           style="display:none; margin-top:12px; text-align:center; text-decoration:none; background:#5cb85c">
-          ⬇ Download
-        </a>
+        <button class="btn btn-success" id="btnDownload" style="display:none" onclick="triggerDownload()">
+          &#8681; Download
+        </button>
       </div>
     </div>
 
@@ -151,20 +151,11 @@
   <script>
     let selectedFormat = 'pdf';
     let pollTimer = null;
-    // Auto-detect: local = server fetches images; remote = browser fetches images
-    const isLocal = ['localhost', '127.0.0.1'].includes(window.location.hostname);
 
     function selectFormat(el) {
       document.querySelectorAll('.format-option').forEach(o => o.classList.remove('selected'));
       el.classList.add('selected');
       selectedFormat = el.dataset.format;
-    }
-
-    function showDownloadButton(fmt) {
-      const btn = document.getElementById('downloadBtn');
-      btn.href = `/api/ocr/download/${fmt}`;
-      btn.textContent = `⬇ Download ${fmt.toUpperCase()}`;
-      btn.style.display = 'block';
     }
 
     function extractUuid(input) {
@@ -173,179 +164,161 @@
       return match ? match[1] : input;
     }
 
-    function setStatus(msg, cls) {
-      const el = document.getElementById('statusText');
-      el.textContent = msg;
-      el.className = 'status-text' + (cls ? ' ' + cls : '');
+    function showDownloadButton(fmt) {
+      const btn = document.getElementById('btnDownload');
+      btn.dataset.fmt = fmt || 'pdf';
+      btn.style.display = 'block';
     }
 
-    function setProgress(pct) {
-      document.getElementById('progressFill').style.width = pct + '%';
-    }
-
-    function arrayBufferToBase64(buffer) {
-      let binary = '';
-      const bytes = new Uint8Array(buffer);
-      for (let i = 0; i < bytes.length; i += 8192)
-        binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + 8192, bytes.length)));
-      return btoa(binary);
-    }
-
-    function startPolling() {
-      if (pollTimer) clearInterval(pollTimer);
-      pollTimer = setInterval(async () => {
-        try {
-          const s = await (await fetch('/api/ocr/status')).json();
-          setProgress(s.progress);
-          setStatus(s.message);
-          if (s.status === 'done') {
-            clearInterval(pollTimer);
-            setStatus('Conversion complete!', 'done');
-            document.getElementById('btnConvert').disabled = false;
-            showDownloadButton(s.format || selectedFormat);
-          } else if (s.status === 'error') {
-            clearInterval(pollTimer);
-            setStatus(s.message, 'error');
-            document.getElementById('btnConvert').disabled = false;
-          }
-        } catch(e) { clearInterval(pollTimer); }
-      }, 1000);
+    function triggerDownload() {
+      const fmt = document.getElementById('btnDownload').dataset.fmt || selectedFormat;
+      // Use a hidden <a> click so the page doesn't navigate away
+      const a = document.createElement('a');
+      a.href = '/api/ocr/download/' + fmt;
+      a.download = '';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
     }
 
     async function authenticate() {
       const jsessionid = document.getElementById('jsessionid').value.trim();
       const shibsession = document.getElementById('shibsession').value.trim();
       if (!jsessionid) { alert('Please enter JSESSIONID'); return; }
-      let cookie = `JSESSIONID=${jsessionid}`;
-      if (shibsession)
-        cookie += `; ${shibsession.includes('=') ? shibsession : '_shibsession_=' + shibsession}`;
+
+      let cookie = 'JSESSIONID=' + jsessionid;
+      if (shibsession) {
+        cookie += '; ' + (shibsession.includes('=') ? shibsession : '_shibsession_=' + shibsession);
+      }
+
       try {
         await fetch('/auth/set-cookie', {
-          method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({cookie}),
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cookie }),
         });
-        const data = await (await fetch('/auth/status')).json();
-        const badge = document.getElementById('authBadge');
-        if (data.user && data.user.lname && data.user.lname !== 'not_logged') {
-          badge.className = 'auth-status ok';
-          badge.innerHTML = `<span class="dot"></span>${data.user.firstname} ${data.user.surname}`;
-        } else {
-          badge.className = 'auth-status';
-          badge.innerHTML = '<span class="dot"></span>cookie set';
+        const resp = await fetch('/auth/status');
+        const data = await resp.json();
+        updateAuthBadge(data);
+      } catch (e) {
+        alert('Connection error: ' + e.message);
+      }
+    }
+
+    function updateAuthBadge(data) {
+      const badge = document.getElementById('authBadge');
+      if (data.user && data.user.lname && data.user.lname !== 'not_logged') {
+        badge.className = 'auth-status ok';
+        const name = (data.user.firstname || '') + ' ' + (data.user.surname || data.user.lname);
+        badge.innerHTML = '<span class="dot"></span>' + name.trim();
+      } else if (data.has_cookie) {
+        badge.className = 'auth-status';
+        badge.innerHTML = '<span class="dot"></span>cookie set';
+      }
+    }
+
+    function startPolling(fmt) {
+      const progressFill = document.getElementById('progressFill');
+      const statusText   = document.getElementById('statusText');
+      const btnConvert   = document.getElementById('btnConvert');
+
+      pollTimer = setInterval(async () => {
+        try {
+          const sr = await fetch('/api/ocr/status');
+          const s  = await sr.json();
+          progressFill.style.width = s.progress + '%';
+          statusText.textContent   = s.message || 'Processing...';
+
+          if (s.status === 'done') {
+            clearInterval(pollTimer);
+            progressFill.style.width = '100%';
+            statusText.className     = 'status-text done';
+            statusText.textContent   = 'Done! Click below to download.';
+            btnConvert.disabled      = false;
+            showDownloadButton(s.format || fmt);
+          } else if (s.status === 'error') {
+            clearInterval(pollTimer);
+            statusText.className   = 'status-text error';
+            statusText.textContent = s.message || 'Error during conversion';
+            btnConvert.disabled    = false;
+          }
+        } catch (e) {
+          // Network blip — keep polling, job runs independently on server
+          statusText.textContent = 'Reconnecting...';
         }
-      } catch(e) { alert('Connection error: ' + e.message); }
+      }, 1500);
     }
 
     async function startConversion() {
       const bookInput = document.getElementById('bookLink').value.trim();
       if (!bookInput) { alert('Please enter a book link or UUID'); return; }
-      const uuid = extractUuid(bookInput);
-      const pageRange = document.getElementById('pageRange').value.trim();
 
-      document.getElementById('btnConvert').disabled = true;
-      document.getElementById('downloadBtn').style.display = 'none';
-      document.getElementById('statusArea').classList.add('visible');
-      setStatus('Starting...'); setProgress(0);
+      const uuid      = extractUuid(bookInput);
+      const pageRange = document.getElementById('pageRange').value.trim();
+      const btn       = document.getElementById('btnConvert');
+      const statusArea  = document.getElementById('statusArea');
+      const statusText  = document.getElementById('statusText');
+      const progressFill = document.getElementById('progressFill');
+      const btnDownload  = document.getElementById('btnDownload');
+
+      if (pollTimer) clearInterval(pollTimer);
+      btn.disabled = true;
+      btnDownload.style.display = 'none';
+      statusArea.classList.add('visible');
+      statusText.className   = 'status-text';
+      statusText.textContent = 'Starting conversion...';
+      progressFill.style.width = '0%';
 
       try {
-        if (isLocal) {
-          // LOCAL: server fetches images directly (same IP as browser)
-          const data = await (await fetch('/api/ocr/start', {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({uuid, format: selectedFormat, pages: pageRange}),
-          })).json();
-          if (data.error) { setStatus(data.error, 'error'); document.getElementById('btnConvert').disabled = false; return; }
-          startPolling();
-        } else {
-          // REMOTE (Railway): browser fetches images → POSTs to server for OCR
-          await _remoteBrowserConversion(uuid, pageRange);
+        const resp = await fetch('/api/ocr/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uuid, format: selectedFormat, pages: pageRange }),
+        });
+        const data = await resp.json();
+
+        if (data.error) {
+          statusText.textContent = data.error;
+          statusText.className   = 'status-text error';
+          btn.disabled = false;
+          return;
         }
-      } catch(e) {
-        setStatus('Error: ' + e.message, 'error');
-        document.getElementById('btnConvert').disabled = false;
+
+        startPolling(selectedFormat);
+      } catch (e) {
+        statusText.textContent = 'Error: ' + e.message;
+        statusText.className   = 'status-text error';
+        btn.disabled = false;
       }
     }
 
-    async function _remoteBrowserConversion(uuid, pageRange) {
-      // 1. Fetch page list via proxy (only needs metadata)
-      setStatus('Fetching book info...');
-      const pd = await (await fetch(`/api/pages?uuid=${encodeURIComponent(uuid)}&pages=${encodeURIComponent(pageRange)}`)).json();
-      if (pd.error) throw new Error(pd.error);
-      const {title, pages} = pd;
-
-      // 2. Init job on server
-      const ir = await (await fetch('/api/ocr/init', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({title, total: pages.length, format: selectedFormat}),
-      })).json();
-      if (!ir.ok) throw new Error('Failed to init job');
-
-      // 3. For each page: browser fetches from ndk.cz, POSTs bytes to Railway
-      for (let i = 0; i < pages.length; i++) {
-        const {pid, label} = pages[i];
-        setProgress(Math.round(i / pages.length * 88));
-        setStatus(`Fetching page ${i+1}/${pages.length}...`);
-
-        // Browser fetches using its own session cookies (same IP = works!)
-        let imgBuffer = null;
-        for (const q of ['full', 'preview', 'thumb']) {
-          try {
-            const r = await fetch(`https://ndk.cz/search/api/v5.0/item/${pid}/${q}`,
-              {credentials: 'include', mode: 'cors'});
-            if (r.ok) { imgBuffer = await r.arrayBuffer(); break; }
-          } catch(e) { /* CORS or network, try next quality */ }
-        }
-        if (!imgBuffer) throw new Error(
-          `Cannot read images from ndk.cz (CORS blocked).\n` +
-          `Make sure you are logged in at ndk.cz in this browser.\n` +
-          `If this persists, ndk.cz may need to add CORS headers — use the app locally instead.`
-        );
-
-        setStatus(`OCR page ${i+1}/${pages.length}...`);
-        const sd = await (await fetch('/api/ocr/submit-page', {
-          method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({page_num: i, label, image_b64: arrayBufferToBase64(imgBuffer)}),
-        })).json();
-        if (sd.error) throw new Error(`Page ${i+1} OCR error: ${sd.error}`);
-      }
-
-      // 4. Trigger PDF/EPUB generation
-      setProgress(92); setStatus(`Generating ${selectedFormat.toUpperCase()}...`);
-      await fetch('/api/ocr/finalize', {
-        method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
-      });
-
-      // 5. Poll until done
-      startPolling();
-    }
-
-    // On load: restore auth + any active/completed job
+    // On page load: restore auth badge + show download button if a job is already done
     (async () => {
       try {
-        const data = await (await fetch('/auth/status')).json();
-        const badge = document.getElementById('authBadge');
-        if (data.user && data.user.lname && data.user.lname !== 'not_logged') {
-          badge.className = 'auth-status ok';
-          badge.innerHTML = `<span class="dot"></span>${data.user.firstname} ${data.user.surname}`;
-        }
-      } catch(e) {}
+        const resp = await fetch('/auth/status');
+        updateAuthBadge(await resp.json());
+      } catch (e) {}
 
       try {
-        const s = await (await fetch('/api/ocr/status')).json();
-        const active = ['done','running','collecting','generating'].includes(s.status);
-        if (active) {
-          document.getElementById('statusArea').classList.add('visible');
-          setProgress(s.progress);
-          if (s.status === 'done') {
-            setStatus('Conversion complete!', 'done');
-            showDownloadButton(s.format || 'pdf');
-          } else {
-            setStatus(s.message || 'Processing...');
-            document.getElementById('btnConvert').disabled = true;
-            startPolling();
-          }
+        const sr = await fetch('/api/ocr/status');
+        const s  = await sr.json();
+        const statusArea   = document.getElementById('statusArea');
+        const progressFill = document.getElementById('progressFill');
+        const statusText   = document.getElementById('statusText');
+
+        if (s.status === 'done') {
+          statusArea.classList.add('visible');
+          progressFill.style.width = '100%';
+          statusText.className     = 'status-text done';
+          statusText.textContent   = 'Previous conversion ready. Click below to download.';
+          showDownloadButton(s.format || 'pdf');
+        } else if (s.status === 'running') {
+          statusArea.classList.add('visible');
+          statusText.textContent = s.message || 'Conversion in progress...';
+          document.getElementById('btnConvert').disabled = true;
+          startPolling(s.format || selectedFormat);
         }
-      } catch(e) {}
+      } catch (e) {}
     })();
   </script>
 </body>

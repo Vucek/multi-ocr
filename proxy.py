@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""Local CORS proxy for ndk.cz Kramerius API + eduID login flow."""
+"""Local CORS proxy for ndk.cz Kramerius API + OCR converter."""
 
 import http.server
-import http.cookiejar
 import ssl
 import urllib.request
 import urllib.error
@@ -10,36 +9,30 @@ import os
 import io
 import json
 import threading
-import tempfile
 import subprocess
 import re
 import time
-from urllib.parse import urlparse, parse_qs, urlencode
+from urllib.parse import urlparse, parse_qs
 
 PORT = int(os.environ.get('PORT', 3456))
 NDK_HOST = 'ndk.cz'
 STATIC_DIR = os.path.dirname(os.path.abspath(__file__))
-STATE_FILE = '/tmp/kramerius_ocr_state.json'
+OUTPUT_DIR = os.path.join(STATIC_DIR, 'output')
+STATE_FILE = os.path.join(OUTPUT_DIR, 'last_job.json')
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-# Persistent session store: cookie string captured after login
-session_store = {
-    'cookie': '',
-    'user': None,
-}
+# Persistent session store
+session_store = {'cookie': '', 'user': None}
 store_lock = threading.Lock()
 
 # OCR job state
 ocr_job = {
-    'status': 'idle',    # idle, running, collecting, generating, done, error
+    'status': 'idle',   # idle, running, done, error
     'progress': 0,
     'message': '',
     'result_path': '',
     'result_format': '',
     'title': '',
-    'total_pages': 0,
-    'received_pages': 0,
-    'tmpdir': '',
-    'pages': {},         # {str(page_num): {label, text, img_path}}
 }
 ocr_lock = threading.Lock()
 
@@ -54,8 +47,10 @@ MIME_TYPES = {
 }
 
 
+# ---- NDK fetch helpers ----
+
 def fetch_ndk_data(path, cookie=''):
-    """Fetch data from ndk.cz."""
+    """Fetch data from ndk.cz with a 60-second timeout."""
     url = f'https://{NDK_HOST}{path}'
     headers = {
         'Host': NDK_HOST,
@@ -73,7 +68,7 @@ def fetch_ndk_data(path, cookie=''):
 
 
 def fetch_ndk_retry(path, cookie='', retries=4):
-    """Fetch with exponential backoff — survives transient network drops (e.g. sleep/wake)."""
+    """Fetch with exponential backoff — survives transient network drops (sleep/wake)."""
     last_exc = None
     for attempt in range(retries):
         try:
@@ -87,33 +82,46 @@ def fetch_ndk_retry(path, cookie='', retries=4):
     raise last_exc
 
 
+# ---- State persistence ----
+
 def _save_ocr_state():
-    """Persist completed job state to disk so it survives server restarts."""
+    """Persist essential job completion info so download survives server restarts."""
     try:
+        snapshot = {}
         with ocr_lock:
-            state = dict(ocr_job)
+            for k in ('status', 'progress', 'message', 'result_path', 'result_format', 'title'):
+                snapshot[k] = ocr_job[k]
         with open(STATE_FILE, 'w') as f:
-            json.dump(state, f)
-    except Exception:
-        pass
+            json.dump(snapshot, f)
+        print(f'[OCR] State saved → {STATE_FILE}')
+    except Exception as e:
+        print(f'[OCR] Warning: could not save state: {e}')
 
 
 def _load_ocr_state():
-    """Restore job state from disk on startup (only if result file still exists)."""
-    global ocr_job
+    """On startup, restore a completed job if the output file still exists."""
     try:
         with open(STATE_FILE) as f:
             state = json.load(f)
-        if state.get('status') == 'done' and state.get('result_path') and os.path.isfile(state['result_path']):
+        path = state.get('result_path', '')
+        if state.get('status') == 'done' and path and os.path.isfile(path):
             with ocr_lock:
                 ocr_job.update(state)
             print(f'[OCR] Restored completed job: {state.get("title", "")}')
-    except Exception:
+            print(f'[OCR] File ready at: {path}')
+        else:
+            if path and not os.path.isfile(path):
+                print(f'[OCR] Previous output file gone, starting fresh: {path}')
+    except FileNotFoundError:
         pass
+    except Exception as e:
+        print(f'[OCR] Could not load state: {e}')
 
+
+# ---- OCR pipeline ----
 
 def parse_page_range(range_str, max_pages):
-    """Parse '1-10' or '1,3,5-8' into list of 0-based indices."""
+    """Parse '1-10' or '1,3,5-8' into sorted list of 0-based indices."""
     if not range_str or not range_str.strip():
         return list(range(max_pages))
     indices = set()
@@ -131,18 +139,18 @@ def parse_page_range(range_str, max_pages):
 
 
 def run_ocr_job(uuid, fmt, page_range_str):
-    """Background OCR job: fetch pages, OCR, produce PDF or EPUB."""
-    global ocr_job
+    """Background thread: fetch pages from NDK, OCR, produce PDF or EPUB."""
     try:
         with ocr_lock:
             ocr_job['status'] = 'running'
             ocr_job['progress'] = 0
             ocr_job['message'] = 'Fetching book metadata...'
+            ocr_job['result_path'] = ''
 
         with store_lock:
             cookie = session_store['cookie']
 
-        # 1. Get metadata
+        # 1. Metadata
         meta_raw, _ = fetch_ndk_retry(f'/search/api/v5.0/item/{uuid}', cookie)
         meta = json.loads(meta_raw)
         title = meta.get('title', 'Unknown')
@@ -150,67 +158,62 @@ def run_ocr_job(uuid, fmt, page_range_str):
             ocr_job['title'] = title
             ocr_job['message'] = f'Found: {title}'
 
-        # 2. Get page list
+        # 2. Page list
         children_raw, _ = fetch_ndk_retry(f'/search/api/v5.0/item/{uuid}/children', cookie)
-        pages = json.loads(children_raw)
-        total = len(pages)
-
-        indices = parse_page_range(page_range_str, total)
+        all_pages = json.loads(children_raw)
+        indices = parse_page_range(page_range_str, len(all_pages))
         num_pages = len(indices)
-
         with ocr_lock:
             ocr_job['message'] = f'Processing {num_pages} pages...'
 
-        # 3. Download images and OCR
+        # 3. Download images + OCR
         from PIL import Image
         import pytesseract
-        # Ensure tesseract binary is found (Homebrew installs to /opt/homebrew/bin)
         if os.path.isfile('/opt/homebrew/bin/tesseract'):
             pytesseract.pytesseract.tesseract_cmd = '/opt/homebrew/bin/tesseract'
 
         ocr_texts = []
         pil_images = []
-        tmpdir = tempfile.mkdtemp(prefix='kramerius_ocr_')
 
         for i, page_idx in enumerate(indices):
-            page = pages[page_idx]
+            page = all_pages[page_idx]
             pid = page['pid']
             label = page.get('title', f'Page {page_idx + 1}')
 
             with ocr_lock:
-                ocr_job['progress'] = int((i / num_pages) * 90)
+                ocr_job['progress'] = int((i / num_pages) * 85)
                 ocr_job['message'] = f'OCR page {i+1}/{num_pages}: {label}'
 
-            # Download full image (with retry on each tier)
-            try:
-                img_data, ct = fetch_ndk_retry(f'/search/api/v5.0/item/{pid}/full', cookie)
-            except Exception:
+            # Try full → preview → thumb
+            img_data = None
+            for tier in ('full', 'preview', 'thumb'):
                 try:
-                    img_data, ct = fetch_ndk_retry(f'/search/api/v5.0/item/{pid}/preview', cookie)
+                    img_data, _ = fetch_ndk_retry(f'/search/api/v5.0/item/{pid}/{tier}', cookie)
+                    break
                 except Exception:
-                    img_data, ct = fetch_ndk_retry(f'/search/api/v5.0/item/{pid}/thumb', cookie)
+                    continue
+            if img_data is None:
+                raise RuntimeError(f'Could not fetch image for page {page_idx + 1}')
 
             img = Image.open(io.BytesIO(img_data))
             if img.mode != 'RGB':
                 img = img.convert('RGB')
             pil_images.append(img)
 
-            # OCR with Czech language
             text = pytesseract.image_to_string(img, lang='ces+eng')
             ocr_texts.append((label, text))
-
             print(f'[OCR] Page {i+1}/{num_pages} done ({len(text)} chars)')
 
         with ocr_lock:
             ocr_job['progress'] = 90
             ocr_job['message'] = f'Generating {fmt.upper()}...'
 
-        # 4. Generate output
+        # 4. Generate output into stable OUTPUT_DIR (not a temp dir)
         safe_title = re.sub(r'[^\w\s-]', '', title)[:60].strip() or 'book'
-        out_path = os.path.join(tmpdir, f'{safe_title}.{fmt}')
+        out_path = os.path.join(OUTPUT_DIR, f'{safe_title}.{fmt}')
 
         if fmt == 'pdf':
-            _generate_pdf(pil_images, ocr_texts, out_path, title)
+            _generate_pdf(pil_images, ocr_texts, out_path)
         else:
             _generate_epub(ocr_texts, out_path, title)
 
@@ -222,7 +225,7 @@ def run_ocr_job(uuid, fmt, page_range_str):
             ocr_job['result_format'] = fmt
 
         _save_ocr_state()
-        print(f'[OCR] Done: {out_path}')
+        print(f'[OCR] Done → {out_path}')
 
     except Exception as e:
         print(f'[OCR] Error: {e}')
@@ -232,80 +235,92 @@ def run_ocr_job(uuid, fmt, page_range_str):
             ocr_job['message'] = str(e)
 
 
-def _generate_pdf(images, ocr_texts, out_path, title):
-    """Generate searchable PDF using Tesseract's PDF output."""
+def _generate_pdf(images, ocr_texts, out_path):
+    """Generate searchable PDF: Tesseract PDF per page → merge with pikepdf."""
     import pytesseract
-    from PIL import Image
+
+    if os.path.isfile('/opt/homebrew/bin/tesseract'):
+        pytesseract.pytesseract.tesseract_cmd = '/opt/homebrew/bin/tesseract'
 
     pdf_pages = []
-    for i, img in enumerate(images):
-        # Use Tesseract to generate a searchable PDF page
+    for img in images:
         pdf_bytes = pytesseract.image_to_pdf_or_hocr(img, lang='ces+eng', extension='pdf')
         pdf_pages.append(pdf_bytes)
 
     if len(pdf_pages) == 1:
         with open(out_path, 'wb') as f:
             f.write(pdf_pages[0])
-    else:
-        # Merge PDF pages manually (simple concatenation via pikepdf or raw)
-        try:
-            # Try pikepdf first
-            import pikepdf
-            merged = pikepdf.Pdf.new()
-            for page_bytes in pdf_pages:
-                src = pikepdf.Pdf.open(io.BytesIO(page_bytes))
-                merged.pages.extend(src.pages)
-            merged.save(out_path)
-        except ImportError:
-            # Fallback: write individual PDFs and merge with ghostscript or just use first
-            tmpdir = os.path.dirname(out_path)
-            page_files = []
+        return
+
+    # Merge with pikepdf
+    try:
+        import pikepdf
+        merged = pikepdf.Pdf.new()
+        for page_bytes in pdf_pages:
+            src = pikepdf.Pdf.open(io.BytesIO(page_bytes))
+            merged.pages.extend(src.pages)
+        merged.save(out_path)
+        return
+    except ImportError:
+        pass
+
+    # Fallback: PyPDF2
+    try:
+        import tempfile
+        from PyPDF2 import PdfMerger
+        page_files = []
+        with tempfile.TemporaryDirectory() as td:
             for i, pb in enumerate(pdf_pages):
-                pf = os.path.join(tmpdir, f'page_{i:04d}.pdf')
+                pf = os.path.join(td, f'p{i:04d}.pdf')
                 with open(pf, 'wb') as f:
                     f.write(pb)
                 page_files.append(pf)
-            # Try Python-based merge with PyPDF2
-            try:
-                from PyPDF2 import PdfMerger
-                merger = PdfMerger()
-                for pf in page_files:
-                    merger.append(pf)
-                merger.write(out_path)
-                merger.close()
-            except ImportError:
-                # Last resort: use ghostscript
-                try:
-                    subprocess.run(
-                        ['gs', '-dBATCH', '-dNOPAUSE', '-q', '-sDEVICE=pdfwrite',
-                         f'-sOutputFile={out_path}'] + page_files,
-                        check=True, timeout=120
-                    )
-                except Exception:
-                    # Absolute fallback: just use the first page
-                    import shutil
-                    shutil.copy(page_files[0], out_path)
+            merger = PdfMerger()
+            for pf in page_files:
+                merger.append(pf)
+            merger.write(out_path)
+            merger.close()
+        return
+    except ImportError:
+        pass
+
+    # Last resort: ghostscript
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        page_files = []
+        for i, pb in enumerate(pdf_pages):
+            pf = os.path.join(td, f'p{i:04d}.pdf')
+            with open(pf, 'wb') as f:
+                f.write(pb)
+            page_files.append(pf)
+        try:
+            subprocess.run(
+                ['gs', '-dBATCH', '-dNOPAUSE', '-q', '-sDEVICE=pdfwrite',
+                 f'-sOutputFile={out_path}'] + page_files,
+                check=True, timeout=300
+            )
+        except Exception:
+            import shutil
+            shutil.copy(page_files[0], out_path)
 
 
 def _generate_epub(ocr_texts, out_path, title):
-    """Generate EPUB from OCR texts."""
+    """Generate EPUB from OCR text."""
     from ebooklib import epub
 
     book = epub.EpubBook()
-    book.set_identifier(f'kramerius-{hash(title)}')
+    book.set_identifier(f'kramerius-{abs(hash(title))}')
     book.set_title(title)
     book.set_language('cs')
 
     chapters = []
     for i, (label, text) in enumerate(ocr_texts):
         ch = epub.EpubHtml(title=label, file_name=f'page_{i:04d}.xhtml', lang='cs')
-        # Convert text to HTML paragraphs
         paragraphs = text.strip().split('\n\n')
         html_parts = []
         for p in paragraphs:
             p = p.strip()
             if p:
-                # Escape HTML
                 p = p.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
                 p = p.replace('\n', '<br/>')
                 html_parts.append(f'<p>{p}</p>')
@@ -318,14 +333,13 @@ def _generate_epub(ocr_texts, out_path, title):
     book.add_item(epub.EpubNav())
     book.spine = ['nav'] + chapters
 
-    # Add basic CSS
-    style = epub.EpubItem(uid='style', file_name='style/default.css',
-                          media_type='text/css',
-                          content='body { font-family: serif; line-height: 1.6; } h2 { margin-bottom: 1em; }')
-    book.add_item(style)
-
+    css = epub.EpubItem(uid='style', file_name='style/default.css', media_type='text/css',
+                        content='body{font-family:serif;line-height:1.6}h2{margin-bottom:1em}')
+    book.add_item(css)
     epub.write_epub(out_path, book)
 
+
+# ---- HTTP handler ----
 
 class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
@@ -342,8 +356,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._auth_set_cookie()
         elif path == '/auth/clear':
             self._auth_clear()
-        elif path == '/api/pages':
-            self._pages()
         elif path == '/api/ocr/status':
             self._ocr_status()
         elif path.startswith('/api/ocr/download/'):
@@ -365,27 +377,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._auth_set_cookie_post()
         elif path == '/api/ocr/start':
             self._ocr_start()
-        elif path == '/api/ocr/init':
-            self._ocr_init()
-        elif path == '/api/ocr/submit-page':
-            self._ocr_submit_page()
-        elif path == '/api/ocr/finalize':
-            self._ocr_finalize()
         else:
             self.send_error(404)
 
-    # ---- Auth endpoints ----
+    # ---- Auth ----
 
     def _auth_status(self):
-        """Check current session: tries to call /user with stored cookie."""
         with store_lock:
             cookie = session_store['cookie']
 
         result = {'has_cookie': bool(cookie), 'cookie_preview': '', 'user': None}
         if cookie:
-            # Mask the cookie for display
             result['cookie_preview'] = cookie[:20] + '...' if len(cookie) > 20 else cookie
-            # Verify by calling user endpoint
             try:
                 user_data = self._fetch_ndk('/search/api/v5.0/user', cookie)
                 user = json.loads(user_data)
@@ -395,32 +398,18 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 result['error'] = str(e)
 
-        body = json.dumps(result).encode()
-        self.send_response(200)
-        self._cors_headers()
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._json_response(result)
 
     def _auth_set_cookie(self):
-        """Set session cookie via GET query param."""
         qs = parse_qs(urlparse(self.path).query)
         cookie_val = qs.get('cookie', [''])[0]
         if cookie_val:
             with store_lock:
                 session_store['cookie'] = cookie_val
             print(f'[AUTH] Cookie set via GET: {cookie_val[:30]}...')
-        body = json.dumps({'ok': True}).encode()
-        self.send_response(200)
-        self._cors_headers()
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._json_response({'ok': True})
 
     def _auth_set_cookie_post(self):
-        """Set session cookie via POST body."""
         length = int(self.headers.get('Content-Length', 0))
         raw = self.rfile.read(length) if length else b''
         try:
@@ -428,41 +417,25 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             cookie_val = data.get('cookie', '')
         except Exception:
             cookie_val = raw.decode().strip()
-
         if cookie_val:
             with store_lock:
                 session_store['cookie'] = cookie_val
             print(f'[AUTH] Cookie set via POST: {cookie_val[:30]}...')
-
-        body = json.dumps({'ok': True}).encode()
-        self.send_response(200)
-        self._cors_headers()
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._json_response({'ok': True})
 
     def _auth_clear(self):
-        """Clear stored session."""
         with store_lock:
             session_store['cookie'] = ''
             session_store['user'] = None
         print('[AUTH] Session cleared')
-        body = json.dumps({'ok': True}).encode()
-        self.send_response(200)
-        self._cors_headers()
-        self.send_header('Content-Type', 'application/json')
-        self.send_header('Content-Length', str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._json_response({'ok': True})
 
     # ---- Proxy ----
 
     def _get_cookie(self):
-        """Get cookie: prefer X-NDK-Cookie header, fall back to stored session."""
-        header_cookie = self.headers.get('X-NDK-Cookie', '')
-        if header_cookie:
-            return header_cookie
+        hdr = self.headers.get('X-NDK-Cookie', '')
+        if hdr:
+            return hdr
         with store_lock:
             return session_store['cookie']
 
@@ -471,7 +444,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         target_url = f'https://{NDK_HOST}{self.path}'
         cookie = self._get_cookie()
 
-        # Sanitize Accept header - browser may send non-latin1 chars
         raw_accept = self.headers.get('Accept', '*/*')
         safe_accept = raw_accept.encode('ascii', 'ignore').decode('ascii') or '*/*'
 
@@ -486,7 +458,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             headers['Cookie'] = cookie
 
         print(f'[PROXY] {method} {self.path} {"(cookie)" if cookie else "(no cookie)"}')
-
         req = urllib.request.Request(target_url, headers=headers, method=method)
         ctx = ssl.create_default_context()
 
@@ -494,22 +465,15 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             resp = urllib.request.urlopen(req, context=ctx, timeout=30)
             ct = resp.headers.get('Content-Type', 'application/octet-stream')
             data = resp.read() if method == 'GET' else b''
-
-            print(f'[PROXY] Response: {resp.status} {ct}')
-
             self.send_response(resp.status)
             self._cors_headers()
             self.send_header('Content-Type', ct)
-            if method == 'GET':
-                self.send_header('Content-Length', str(len(data)))
-            elif resp.headers.get('Content-Length'):
-                self.send_header('Content-Length', resp.headers['Content-Length'])
+            self.send_header('Content-Length', str(len(data)))
             self.end_headers()
             if data:
                 self.wfile.write(data)
 
         except urllib.error.HTTPError as e:
-            print(f'[PROXY] HTTP Error: {e.code}')
             body = b''
             ct = 'text/plain'
             try:
@@ -517,7 +481,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
                 ct = e.headers.get('Content-Type', 'text/plain')
             except Exception:
                 pass
-
             self.send_response(e.code)
             self._cors_headers()
             self.send_header('Content-Type', ct)
@@ -536,13 +499,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self.wfile.write(msg)
 
     def _fetch_ndk(self, path, cookie=''):
-        """Internal helper: fetch from ndk.cz and return body bytes."""
         url = f'https://{NDK_HOST}{path}'
-        headers = {
-            'Host': NDK_HOST,
-            'User-Agent': 'Mozilla/5.0',
-            'Accept': 'application/json',
-        }
+        headers = {'Host': NDK_HOST, 'User-Agent': 'Mozilla/5.0', 'Accept': 'application/json'}
         if cookie:
             headers['Cookie'] = cookie
         req = urllib.request.Request(url, headers=headers)
@@ -550,7 +508,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         resp = urllib.request.urlopen(req, context=ctx, timeout=15)
         return resp.read().decode()
 
-    # ---- OCR endpoints ----
+    # ---- OCR ----
 
     def _ocr_start(self):
         length = int(self.headers.get('Content-Length', 0))
@@ -565,142 +523,22 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         pages = data.get('pages', '')
 
         if not uuid:
-            self._json_response({'error': 'No UUID provided'})
+            self._json_response({'error': 'No UUID provided'}, 400)
             return
 
         with ocr_lock:
             if ocr_job['status'] == 'running':
-                self._json_response({'error': 'A conversion is already in progress'})
+                self._json_response({'error': 'A conversion is already in progress'}, 409)
                 return
             ocr_job['status'] = 'running'
             ocr_job['progress'] = 0
             ocr_job['message'] = 'Starting...'
             ocr_job['result_path'] = ''
+            ocr_job['result_format'] = fmt
 
         t = threading.Thread(target=run_ocr_job, args=(uuid, fmt, pages), daemon=True)
         t.start()
-
         self._json_response({'ok': True, 'message': 'OCR job started'})
-
-    def _pages(self):
-        """Return page list for a UUID (used by browser-relay flow)."""
-        qs = parse_qs(urlparse(self.path).query)
-        uuid = qs.get('uuid', [''])[0]
-        pages_str = qs.get('pages', [''])[0]
-        if not uuid:
-            self._json_response({'error': 'No UUID'}, 400)
-            return
-        with store_lock:
-            cookie = session_store['cookie']
-        try:
-            meta_raw, _ = fetch_ndk_retry(f'/search/api/v5.0/item/{uuid}', cookie)
-            title = json.loads(meta_raw).get('title', 'Unknown')
-            children_raw, _ = fetch_ndk_retry(f'/search/api/v5.0/item/{uuid}/children', cookie)
-            all_pages = json.loads(children_raw)
-            indices = parse_page_range(pages_str, len(all_pages))
-            pages = [{'pid': all_pages[i]['pid'],
-                      'label': all_pages[i].get('title', f'Page {i+1}')} for i in indices]
-            self._json_response({'title': title, 'pages': pages})
-        except Exception as e:
-            self._json_response({'error': str(e)}, 400)
-
-    def _ocr_init(self):
-        """Initialize browser-relay OCR job."""
-        length = int(self.headers.get('Content-Length', 0))
-        data = json.loads(self.rfile.read(length) if length else b'{}')
-        title = data.get('title', 'book')
-        total = int(data.get('total', 0))
-        fmt = data.get('format', 'pdf')
-        tmpdir = tempfile.mkdtemp(prefix='kramerius_ocr_')
-        with ocr_lock:
-            ocr_job.update({
-                'status': 'collecting', 'progress': 0,
-                'message': f'Waiting for pages (0/{total})...',
-                'title': title, 'total_pages': total, 'received_pages': 0,
-                'result_format': fmt, 'result_path': '',
-                'tmpdir': tmpdir, 'pages': {},
-            })
-        self._json_response({'ok': True})
-
-    def _ocr_submit_page(self):
-        """Receive one image page from browser, OCR it, store result."""
-        import base64 as b64mod
-        from PIL import Image
-        import pytesseract
-        if os.path.isfile('/opt/homebrew/bin/tesseract'):
-            pytesseract.pytesseract.tesseract_cmd = '/opt/homebrew/bin/tesseract'
-
-        length = int(self.headers.get('Content-Length', 0))
-        data = json.loads(self.rfile.read(length) if length else b'{}')
-        page_num = int(data.get('page_num', 0))
-        label = data.get('label', f'Page {page_num+1}')
-        image_b64 = data.get('image_b64', '')
-
-        with ocr_lock:
-            if ocr_job.get('status') != 'collecting':
-                self._json_response({'error': 'No active collecting job'}, 400)
-                return
-            tmpdir = ocr_job.get('tmpdir', tempfile.gettempdir())
-            total = ocr_job.get('total_pages', 1)
-
-        try:
-            img_bytes = b64mod.b64decode(image_b64)
-            img = Image.open(io.BytesIO(img_bytes))
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            img_path = os.path.join(tmpdir, f'page_{page_num:04d}.jpg')
-            img.save(img_path, 'JPEG', quality=85)
-            text = pytesseract.image_to_string(img, lang='ces+eng')
-            with ocr_lock:
-                ocr_job['pages'][str(page_num)] = {'label': label, 'text': text, 'img_path': img_path}
-                ocr_job['received_pages'] = len(ocr_job['pages'])
-                received = ocr_job['received_pages']
-                ocr_job['progress'] = int(received / max(total, 1) * 88)
-                ocr_job['message'] = f'OCR {received}/{total}: {label}'
-            print(f'[OCR] Page {page_num} done ({len(text)} chars)')
-            self._json_response({'ok': True, 'page_num': page_num})
-        except Exception as e:
-            print(f'[OCR] Page {page_num} error: {e}')
-            self._json_response({'error': str(e)}, 500)
-
-    def _ocr_finalize(self):
-        """Generate PDF/EPUB from all browser-submitted pages."""
-        with ocr_lock:
-            if ocr_job.get('status') != 'collecting':
-                self._json_response({'error': 'No collecting job to finalize'}, 400)
-                return
-            pages_data = dict(ocr_job.get('pages', {}))
-            fmt = ocr_job.get('result_format', 'pdf')
-            title = ocr_job.get('title', 'book')
-            tmpdir = ocr_job.get('tmpdir', tempfile.gettempdir())
-            ocr_job['status'] = 'generating'
-            ocr_job['progress'] = 92
-            ocr_job['message'] = f'Generating {fmt.upper()}...'
-        self._json_response({'ok': True, 'pages': len(pages_data)})
-
-        def finalize_bg():
-            try:
-                from PIL import Image
-                sorted_pages = sorted(pages_data.items(), key=lambda x: int(x[0]))
-                ocr_texts = [(p['label'], p['text']) for _, p in sorted_pages]
-                pil_images = [Image.open(p['img_path']) for _, p in sorted_pages]
-                safe = re.sub(r'[^\w\s-]', '', title)[:60].strip() or 'book'
-                out_path = os.path.join(tmpdir, f'{safe}.{fmt}')
-                if fmt == 'pdf':
-                    _generate_pdf(pil_images, ocr_texts, out_path, title)
-                else:
-                    _generate_epub(ocr_texts, out_path, title)
-                with ocr_lock:
-                    ocr_job.update({'status': 'done', 'progress': 100,
-                                    'message': 'Conversion complete!', 'result_path': out_path})
-                _save_ocr_state()
-                print(f'[OCR] Finalized: {out_path}')
-            except Exception as e:
-                print(f'[OCR] Finalize error: {e}')
-                import traceback; traceback.print_exc()
-                with ocr_lock:
-                    ocr_job.update({'status': 'error', 'message': str(e)})
-        threading.Thread(target=finalize_bg, daemon=True).start()
 
     def _ocr_status(self):
         with ocr_lock:
@@ -717,31 +555,32 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             fmt = ocr_job.get('result_format', 'pdf')
             title = ocr_job.get('title', 'book')
 
+        print(f'[DOWNLOAD] path={path!r} exists={os.path.isfile(path) if path else False}')
+
         if not path or not os.path.isfile(path):
             self.send_error(404, 'No file ready')
             return
 
         ct = 'application/pdf' if fmt == 'pdf' else 'application/epub+zip'
-        # ASCII-safe fallback filename for Content-Disposition header
         ascii_title = title.encode('ascii', 'ignore').decode('ascii')
-        safe_title = re.sub(r'[^\w\s-]', '', ascii_title)[:60].strip() or 'book'
-        filename_ascii = f'{safe_title}.{fmt}'
-        # UTF-8 encoded filename for browsers supporting RFC 5987
+        safe_ascii = re.sub(r'[^\w\s-]', '', ascii_title)[:60].strip() or 'book'
         import urllib.parse
-        _clean = re.sub(r'[^\w\s-]', '', title)[:60].strip() or 'book'
+        _clean = re.sub(r'[^\w\s.-]', '', title)[:60].strip() or 'book'
         filename_utf8 = urllib.parse.quote(f'{_clean}.{fmt}')
 
         with open(path, 'rb') as f:
             data = f.read()
 
         self.send_response(200)
+        self._cors_headers()
         self.send_header('Content-Type', ct)
         self.send_header('Content-Length', str(len(data)))
         self.send_header('Content-Disposition',
-                         f'attachment; filename="{filename_ascii}"; filename*=UTF-8\'\'{filename_utf8}')
-        self._cors_headers()
+                         f'attachment; filename="{safe_ascii}.{fmt}"; filename*=UTF-8\'\'{filename_utf8}')
         self.end_headers()
         self.wfile.write(data)
+
+    # ---- Helpers ----
 
     def _json_response(self, obj, status=200):
         body = json.dumps(obj).encode()
@@ -752,8 +591,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    # ---- Static files ----
-
     def _static(self):
         path = self.path.split('?')[0]
         if path == '/':
@@ -761,20 +598,16 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         elif path == '/debug':
             path = '/index.html'
 
-        filepath = os.path.join(STATIC_DIR, path.lstrip('/'))
-        filepath = os.path.normpath(filepath)
-
+        filepath = os.path.normpath(os.path.join(STATIC_DIR, path.lstrip('/')))
         if not filepath.startswith(STATIC_DIR):
             self.send_error(403)
             return
-
         if not os.path.isfile(filepath):
             self.send_error(404)
             return
 
         ext = os.path.splitext(filepath)[1]
         ct = MIME_TYPES.get(ext, 'application/octet-stream')
-
         with open(filepath, 'rb') as f:
             data = f.read()
 
@@ -787,8 +620,7 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
     def _cors_headers(self):
         self.send_header('Access-Control-Allow-Origin', '*')
         self.send_header('Access-Control-Allow-Methods', 'GET, HEAD, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers',
-                         'Content-Type, X-NDK-Cookie, Cookie')
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-NDK-Cookie, Cookie')
         self.send_header('Access-Control-Expose-Headers',
                          'X-Set-Cookie, X-Redirect-Url, Content-Length, Content-Type')
 
@@ -797,7 +629,6 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
 
 
 class ThreadedHTTPServer(http.server.HTTPServer):
-    """Handle requests in separate threads for concurrent image loads."""
     def process_request(self, request, client_address):
         t = threading.Thread(target=self.process_request_thread,
                              args=(request, client_address))
@@ -816,10 +647,9 @@ class ThreadedHTTPServer(http.server.HTTPServer):
 if __name__ == '__main__':
     _load_ocr_state()
     server = ThreadedHTTPServer(('', PORT), ProxyHandler)
-    print(f'\n  Kramerius Debug Proxy running at http://localhost:{PORT}\n')
-    print(f'  Static files: {STATIC_DIR}')
-    print(f'  Proxy target: https://{NDK_HOST}/search/...')
-    print(f'  Auth endpoints: /auth/status, /auth/set-cookie, /auth/clear\n')
+    print(f'\n  Kramerius OCR Converter running at http://localhost:{PORT}')
+    print(f'  Output directory: {OUTPUT_DIR}')
+    print(f'  Debug interface:  http://localhost:{PORT}/debug\n')
     try:
         server.serve_forever()
     except KeyboardInterrupt:
