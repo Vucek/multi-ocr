@@ -30,12 +30,16 @@ store_lock = threading.Lock()
 
 # OCR job state
 ocr_job = {
-    'status': 'idle',    # idle, running, done, error
+    'status': 'idle',    # idle, running, collecting, generating, done, error
     'progress': 0,
     'message': '',
     'result_path': '',
     'result_format': '',
     'title': '',
+    'total_pages': 0,
+    'received_pages': 0,
+    'tmpdir': '',
+    'pages': {},         # {str(page_num): {label, text, img_path}}
 }
 ocr_lock = threading.Lock()
 
@@ -338,6 +342,8 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._auth_set_cookie()
         elif path == '/auth/clear':
             self._auth_clear()
+        elif path == '/api/pages':
+            self._pages()
         elif path == '/api/ocr/status':
             self._ocr_status()
         elif path.startswith('/api/ocr/download/'):
@@ -359,6 +365,12 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
             self._auth_set_cookie_post()
         elif path == '/api/ocr/start':
             self._ocr_start()
+        elif path == '/api/ocr/init':
+            self._ocr_init()
+        elif path == '/api/ocr/submit-page':
+            self._ocr_submit_page()
+        elif path == '/api/ocr/finalize':
+            self._ocr_finalize()
         else:
             self.send_error(404)
 
@@ -569,6 +581,126 @@ class ProxyHandler(http.server.BaseHTTPRequestHandler):
         t.start()
 
         self._json_response({'ok': True, 'message': 'OCR job started'})
+
+    def _pages(self):
+        """Return page list for a UUID (used by browser-relay flow)."""
+        qs = parse_qs(urlparse(self.path).query)
+        uuid = qs.get('uuid', [''])[0]
+        pages_str = qs.get('pages', [''])[0]
+        if not uuid:
+            self._json_response({'error': 'No UUID'}, 400)
+            return
+        with store_lock:
+            cookie = session_store['cookie']
+        try:
+            meta_raw, _ = fetch_ndk_retry(f'/search/api/v5.0/item/{uuid}', cookie)
+            title = json.loads(meta_raw).get('title', 'Unknown')
+            children_raw, _ = fetch_ndk_retry(f'/search/api/v5.0/item/{uuid}/children', cookie)
+            all_pages = json.loads(children_raw)
+            indices = parse_page_range(pages_str, len(all_pages))
+            pages = [{'pid': all_pages[i]['pid'],
+                      'label': all_pages[i].get('title', f'Page {i+1}')} for i in indices]
+            self._json_response({'title': title, 'pages': pages})
+        except Exception as e:
+            self._json_response({'error': str(e)}, 400)
+
+    def _ocr_init(self):
+        """Initialize browser-relay OCR job."""
+        length = int(self.headers.get('Content-Length', 0))
+        data = json.loads(self.rfile.read(length) if length else b'{}')
+        title = data.get('title', 'book')
+        total = int(data.get('total', 0))
+        fmt = data.get('format', 'pdf')
+        tmpdir = tempfile.mkdtemp(prefix='kramerius_ocr_')
+        with ocr_lock:
+            ocr_job.update({
+                'status': 'collecting', 'progress': 0,
+                'message': f'Waiting for pages (0/{total})...',
+                'title': title, 'total_pages': total, 'received_pages': 0,
+                'result_format': fmt, 'result_path': '',
+                'tmpdir': tmpdir, 'pages': {},
+            })
+        self._json_response({'ok': True})
+
+    def _ocr_submit_page(self):
+        """Receive one image page from browser, OCR it, store result."""
+        import base64 as b64mod
+        from PIL import Image
+        import pytesseract
+        if os.path.isfile('/opt/homebrew/bin/tesseract'):
+            pytesseract.pytesseract.tesseract_cmd = '/opt/homebrew/bin/tesseract'
+
+        length = int(self.headers.get('Content-Length', 0))
+        data = json.loads(self.rfile.read(length) if length else b'{}')
+        page_num = int(data.get('page_num', 0))
+        label = data.get('label', f'Page {page_num+1}')
+        image_b64 = data.get('image_b64', '')
+
+        with ocr_lock:
+            if ocr_job.get('status') != 'collecting':
+                self._json_response({'error': 'No active collecting job'}, 400)
+                return
+            tmpdir = ocr_job.get('tmpdir', tempfile.gettempdir())
+            total = ocr_job.get('total_pages', 1)
+
+        try:
+            img_bytes = b64mod.b64decode(image_b64)
+            img = Image.open(io.BytesIO(img_bytes))
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
+            img_path = os.path.join(tmpdir, f'page_{page_num:04d}.jpg')
+            img.save(img_path, 'JPEG', quality=85)
+            text = pytesseract.image_to_string(img, lang='ces+eng')
+            with ocr_lock:
+                ocr_job['pages'][str(page_num)] = {'label': label, 'text': text, 'img_path': img_path}
+                ocr_job['received_pages'] = len(ocr_job['pages'])
+                received = ocr_job['received_pages']
+                ocr_job['progress'] = int(received / max(total, 1) * 88)
+                ocr_job['message'] = f'OCR {received}/{total}: {label}'
+            print(f'[OCR] Page {page_num} done ({len(text)} chars)')
+            self._json_response({'ok': True, 'page_num': page_num})
+        except Exception as e:
+            print(f'[OCR] Page {page_num} error: {e}')
+            self._json_response({'error': str(e)}, 500)
+
+    def _ocr_finalize(self):
+        """Generate PDF/EPUB from all browser-submitted pages."""
+        with ocr_lock:
+            if ocr_job.get('status') != 'collecting':
+                self._json_response({'error': 'No collecting job to finalize'}, 400)
+                return
+            pages_data = dict(ocr_job.get('pages', {}))
+            fmt = ocr_job.get('result_format', 'pdf')
+            title = ocr_job.get('title', 'book')
+            tmpdir = ocr_job.get('tmpdir', tempfile.gettempdir())
+            ocr_job['status'] = 'generating'
+            ocr_job['progress'] = 92
+            ocr_job['message'] = f'Generating {fmt.upper()}...'
+        self._json_response({'ok': True, 'pages': len(pages_data)})
+
+        def finalize_bg():
+            try:
+                from PIL import Image
+                sorted_pages = sorted(pages_data.items(), key=lambda x: int(x[0]))
+                ocr_texts = [(p['label'], p['text']) for _, p in sorted_pages]
+                pil_images = [Image.open(p['img_path']) for _, p in sorted_pages]
+                safe = re.sub(r'[^\w\s-]', '', title)[:60].strip() or 'book'
+                out_path = os.path.join(tmpdir, f'{safe}.{fmt}')
+                if fmt == 'pdf':
+                    _generate_pdf(pil_images, ocr_texts, out_path, title)
+                else:
+                    _generate_epub(ocr_texts, out_path, title)
+                with ocr_lock:
+                    ocr_job.update({'status': 'done', 'progress': 100,
+                                    'message': 'Conversion complete!', 'result_path': out_path})
+                _save_ocr_state()
+                print(f'[OCR] Finalized: {out_path}')
+            except Exception as e:
+                print(f'[OCR] Finalize error: {e}')
+                import traceback; traceback.print_exc()
+                with ocr_lock:
+                    ocr_job.update({'status': 'error', 'message': str(e)})
+        threading.Thread(target=finalize_bg, daemon=True).start()
 
     def _ocr_status(self):
         with ocr_lock:

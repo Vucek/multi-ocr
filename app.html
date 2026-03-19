@@ -151,6 +151,8 @@
   <script>
     let selectedFormat = 'pdf';
     let pollTimer = null;
+    // Auto-detect: local = server fetches images; remote = browser fetches images
+    const isLocal = ['localhost', '127.0.0.1'].includes(window.location.hostname);
 
     function selectFormat(el) {
       document.querySelectorAll('.format-option').forEach(o => o.classList.remove('selected'));
@@ -167,161 +169,180 @@
 
     function extractUuid(input) {
       input = input.trim();
-      // Try to extract uuid from URL like https://ndk.cz/view/uuid:xxx or uuid:xxx
       const match = input.match(/(uuid:[a-f0-9-]+)/i);
       return match ? match[1] : input;
+    }
+
+    function setStatus(msg, cls) {
+      const el = document.getElementById('statusText');
+      el.textContent = msg;
+      el.className = 'status-text' + (cls ? ' ' + cls : '');
+    }
+
+    function setProgress(pct) {
+      document.getElementById('progressFill').style.width = pct + '%';
+    }
+
+    function arrayBufferToBase64(buffer) {
+      let binary = '';
+      const bytes = new Uint8Array(buffer);
+      for (let i = 0; i < bytes.length; i += 8192)
+        binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + 8192, bytes.length)));
+      return btoa(binary);
+    }
+
+    function startPolling() {
+      if (pollTimer) clearInterval(pollTimer);
+      pollTimer = setInterval(async () => {
+        try {
+          const s = await (await fetch('/api/ocr/status')).json();
+          setProgress(s.progress);
+          setStatus(s.message);
+          if (s.status === 'done') {
+            clearInterval(pollTimer);
+            setStatus('Conversion complete!', 'done');
+            document.getElementById('btnConvert').disabled = false;
+            showDownloadButton(s.format || selectedFormat);
+          } else if (s.status === 'error') {
+            clearInterval(pollTimer);
+            setStatus(s.message, 'error');
+            document.getElementById('btnConvert').disabled = false;
+          }
+        } catch(e) { clearInterval(pollTimer); }
+      }, 1000);
     }
 
     async function authenticate() {
       const jsessionid = document.getElementById('jsessionid').value.trim();
       const shibsession = document.getElementById('shibsession').value.trim();
-
       if (!jsessionid) { alert('Please enter JSESSIONID'); return; }
-
       let cookie = `JSESSIONID=${jsessionid}`;
-      if (shibsession) {
-        // Accept either "NAME=VALUE" or just "VALUE" (prefixed with _shibsession_=)
+      if (shibsession)
         cookie += `; ${shibsession.includes('=') ? shibsession : '_shibsession_=' + shibsession}`;
-      }
-
       try {
         await fetch('/auth/set-cookie', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ cookie }),
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({cookie}),
         });
-
-        const resp = await fetch('/auth/status');
-        const data = await resp.json();
+        const data = await (await fetch('/auth/status')).json();
         const badge = document.getElementById('authBadge');
-
         if (data.user && data.user.lname && data.user.lname !== 'not_logged') {
           badge.className = 'auth-status ok';
           badge.innerHTML = `<span class="dot"></span>${data.user.firstname} ${data.user.surname}`;
         } else {
           badge.className = 'auth-status';
-          badge.innerHTML = '<span class="dot"></span>cookie set, not verified';
+          badge.innerHTML = '<span class="dot"></span>cookie set';
         }
-      } catch (e) {
-        alert('Connection error: ' + e.message);
-      }
+      } catch(e) { alert('Connection error: ' + e.message); }
     }
 
     async function startConversion() {
       const bookInput = document.getElementById('bookLink').value.trim();
       if (!bookInput) { alert('Please enter a book link or UUID'); return; }
-
       const uuid = extractUuid(bookInput);
       const pageRange = document.getElementById('pageRange').value.trim();
-      const btn = document.getElementById('btnConvert');
-      const statusArea = document.getElementById('statusArea');
-      const statusText = document.getElementById('statusText');
-      const progressFill = document.getElementById('progressFill');
 
-      btn.disabled = true;
-      statusArea.classList.add('visible');
-      statusText.className = 'status-text';
-      statusText.textContent = 'Starting conversion...';
-      progressFill.style.width = '0%';
+      document.getElementById('btnConvert').disabled = true;
+      document.getElementById('downloadBtn').style.display = 'none';
+      document.getElementById('statusArea').classList.add('visible');
+      setStatus('Starting...'); setProgress(0);
 
       try {
-        const resp = await fetch('/api/ocr/start', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ uuid, format: selectedFormat, pages: pageRange }),
-        });
-        const data = await resp.json();
-        if (data.error) {
-          statusText.textContent = data.error;
-          statusText.className = 'status-text error';
-          btn.disabled = false;
-          return;
+        if (isLocal) {
+          // LOCAL: server fetches images directly (same IP as browser)
+          const data = await (await fetch('/api/ocr/start', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({uuid, format: selectedFormat, pages: pageRange}),
+          })).json();
+          if (data.error) { setStatus(data.error, 'error'); document.getElementById('btnConvert').disabled = false; return; }
+          startPolling();
+        } else {
+          // REMOTE (Railway): browser fetches images → POSTs to server for OCR
+          await _remoteBrowserConversion(uuid, pageRange);
         }
-
-        // Poll for progress
-        pollTimer = setInterval(async () => {
-          try {
-            const sr = await fetch('/api/ocr/status');
-            const s = await sr.json();
-            progressFill.style.width = s.progress + '%';
-            statusText.textContent = s.message || 'Processing...';
-
-            if (s.status === 'done') {
-              clearInterval(pollTimer);
-              statusText.textContent = 'Conversion complete!';
-              statusText.className = 'status-text done';
-              btn.disabled = false;
-              showDownloadButton(s.format || selectedFormat);
-            } else if (s.status === 'error') {
-              clearInterval(pollTimer);
-              statusText.textContent = s.message || 'Error during conversion';
-              statusText.className = 'status-text error';
-              btn.disabled = false;
-            }
-          } catch (e) {
-            clearInterval(pollTimer);
-            statusText.textContent = 'Lost connection';
-            statusText.className = 'status-text error';
-            btn.disabled = false;
-          }
-        }, 1000);
-
-      } catch (e) {
-        statusText.textContent = 'Error: ' + e.message;
-        statusText.className = 'status-text error';
-        btn.disabled = false;
+      } catch(e) {
+        setStatus('Error: ' + e.message, 'error');
+        document.getElementById('btnConvert').disabled = false;
       }
     }
 
-    // On load: restore auth badge + any completed/running job
+    async function _remoteBrowserConversion(uuid, pageRange) {
+      // 1. Fetch page list via proxy (only needs metadata)
+      setStatus('Fetching book info...');
+      const pd = await (await fetch(`/api/pages?uuid=${encodeURIComponent(uuid)}&pages=${encodeURIComponent(pageRange)}`)).json();
+      if (pd.error) throw new Error(pd.error);
+      const {title, pages} = pd;
+
+      // 2. Init job on server
+      const ir = await (await fetch('/api/ocr/init', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({title, total: pages.length, format: selectedFormat}),
+      })).json();
+      if (!ir.ok) throw new Error('Failed to init job');
+
+      // 3. For each page: browser fetches from ndk.cz, POSTs bytes to Railway
+      for (let i = 0; i < pages.length; i++) {
+        const {pid, label} = pages[i];
+        setProgress(Math.round(i / pages.length * 88));
+        setStatus(`Fetching page ${i+1}/${pages.length}...`);
+
+        // Browser fetches using its own session cookies (same IP = works!)
+        let imgBuffer = null;
+        for (const q of ['full', 'preview', 'thumb']) {
+          try {
+            const r = await fetch(`https://ndk.cz/search/api/v5.0/item/${pid}/${q}`,
+              {credentials: 'include', mode: 'cors'});
+            if (r.ok) { imgBuffer = await r.arrayBuffer(); break; }
+          } catch(e) { /* CORS or network, try next quality */ }
+        }
+        if (!imgBuffer) throw new Error(
+          `Cannot read images from ndk.cz (CORS blocked).\n` +
+          `Make sure you are logged in at ndk.cz in this browser.\n` +
+          `If this persists, ndk.cz may need to add CORS headers — use the app locally instead.`
+        );
+
+        setStatus(`OCR page ${i+1}/${pages.length}...`);
+        const sd = await (await fetch('/api/ocr/submit-page', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({page_num: i, label, image_b64: arrayBufferToBase64(imgBuffer)}),
+        })).json();
+        if (sd.error) throw new Error(`Page ${i+1} OCR error: ${sd.error}`);
+      }
+
+      // 4. Trigger PDF/EPUB generation
+      setProgress(92); setStatus(`Generating ${selectedFormat.toUpperCase()}...`);
+      await fetch('/api/ocr/finalize', {
+        method: 'POST', headers: {'Content-Type': 'application/json'}, body: '{}',
+      });
+
+      // 5. Poll until done
+      startPolling();
+    }
+
+    // On load: restore auth + any active/completed job
     (async () => {
       try {
-        const resp = await fetch('/auth/status');
-        const data = await resp.json();
+        const data = await (await fetch('/auth/status')).json();
         const badge = document.getElementById('authBadge');
         if (data.user && data.user.lname && data.user.lname !== 'not_logged') {
           badge.className = 'auth-status ok';
           badge.innerHTML = `<span class="dot"></span>${data.user.firstname} ${data.user.surname}`;
         }
-      } catch (e) {}
+      } catch(e) {}
 
-      // Restore job state
       try {
-        const sr = await fetch('/api/ocr/status');
-        const s = await sr.json();
-        if (s.status === 'done' || s.status === 'running') {
-          const statusArea = document.getElementById('statusArea');
-          const statusText = document.getElementById('statusText');
-          const progressFill = document.getElementById('progressFill');
-          statusArea.classList.add('visible');
-          progressFill.style.width = s.progress + '%';
+        const s = await (await fetch('/api/ocr/status')).json();
+        const active = ['done','running','collecting','generating'].includes(s.status);
+        if (active) {
+          document.getElementById('statusArea').classList.add('visible');
+          setProgress(s.progress);
           if (s.status === 'done') {
-            statusText.className = 'status-text done';
-            statusText.textContent = 'Conversion complete!';
+            setStatus('Conversion complete!', 'done');
             showDownloadButton(s.format || 'pdf');
           } else {
-            statusText.textContent = s.message || 'Processing...';
-            // Resume polling
+            setStatus(s.message || 'Processing...');
             document.getElementById('btnConvert').disabled = true;
-            pollTimer = setInterval(async () => {
-              try {
-                const r = await fetch('/api/ocr/status');
-                const j = await r.json();
-                progressFill.style.width = j.progress + '%';
-                statusText.textContent = j.message || 'Processing...';
-                if (j.status === 'done') {
-                  clearInterval(pollTimer);
-                  statusText.className = 'status-text done';
-                  statusText.textContent = 'Conversion complete!';
-                  document.getElementById('btnConvert').disabled = false;
-                  showDownloadButton(j.format || 'pdf');
-                } else if (j.status === 'error') {
-                  clearInterval(pollTimer);
-                  statusText.className = 'status-text error';
-                  document.getElementById('btnConvert').disabled = false;
-                }
-              } catch(e) { clearInterval(pollTimer); }
-            }, 1000);
+            startPolling();
           }
         }
       } catch(e) {}
