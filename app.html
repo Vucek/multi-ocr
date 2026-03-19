@@ -1,0 +1,280 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kramerius OCR Converter</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #f8f9fa; color: #333; min-height: 100vh; }
+
+    .container { max-width: 600px; margin: 0 auto; padding: 40px 20px; }
+
+    h1 { font-size: 22px; font-weight: 600; margin-bottom: 4px; }
+    .subtitle { font-size: 13px; color: #888; margin-bottom: 32px; }
+
+    .card {
+      background: #fff; border-radius: 10px; padding: 24px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.08); margin-bottom: 20px;
+    }
+    .card h2 { font-size: 14px; font-weight: 600; margin-bottom: 16px; color: #555; }
+
+    .field { margin-bottom: 14px; }
+    .field:last-child { margin-bottom: 0; }
+    .field label { display: block; font-size: 12px; font-weight: 500; color: #666; margin-bottom: 5px; }
+    .field input, .field select {
+      width: 100%; padding: 10px 12px; border: 1px solid #ddd; border-radius: 6px;
+      font-size: 14px; font-family: inherit; background: #fafafa; transition: border-color 0.2s;
+    }
+    .field input:focus, .field select:focus { outline: none; border-color: #4a90d9; background: #fff; }
+    .field .hint { font-size: 11px; color: #999; margin-top: 4px; }
+
+    .auth-row { display: flex; gap: 10px; }
+    .auth-row .field { flex: 1; }
+
+    .format-row { display: flex; gap: 10px; }
+    .format-option {
+      flex: 1; padding: 12px; border: 2px solid #e8e8e8; border-radius: 8px;
+      text-align: center; cursor: pointer; transition: all 0.2s;
+    }
+    .format-option:hover { border-color: #b8d4f0; }
+    .format-option.selected { border-color: #4a90d9; background: #f0f6ff; }
+    .format-option .fmt-name { font-size: 15px; font-weight: 600; }
+    .format-option .fmt-desc { font-size: 11px; color: #888; margin-top: 2px; }
+
+    .btn {
+      width: 100%; padding: 12px; border: none; border-radius: 8px; font-size: 15px;
+      font-weight: 600; cursor: pointer; transition: all 0.2s; font-family: inherit;
+    }
+    .btn-primary { background: #4a90d9; color: #fff; }
+    .btn-primary:hover { background: #3a7bc8; }
+    .btn-primary:disabled { background: #b8d4f0; cursor: not-allowed; }
+
+    .status-area { margin-top: 16px; display: none; }
+    .status-area.visible { display: block; }
+    .progress-track { height: 6px; background: #eee; border-radius: 3px; overflow: hidden; }
+    .progress-fill { height: 100%; background: #4a90d9; transition: width 0.3s; width: 0%; }
+    .status-text { font-size: 12px; color: #888; margin-top: 8px; text-align: center; }
+    .status-text.error { color: #d9534f; }
+    .status-text.done { color: #5cb85c; }
+
+    .auth-status {
+      display: inline-flex; align-items: center; gap: 6px; font-size: 12px;
+      padding: 4px 10px; border-radius: 12px; background: #f0f0f0; color: #888;
+    }
+    .auth-status .dot { width: 7px; height: 7px; border-radius: 50%; background: #ccc; }
+    .auth-status.ok { background: #e8f5e9; color: #4caf50; }
+    .auth-status.ok .dot { background: #4caf50; }
+
+    .footer {
+      text-align: center; margin-top: 24px; font-size: 12px; color: #bbb;
+    }
+    .footer a { color: #4a90d9; text-decoration: none; }
+    .footer a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Kramerius OCR Converter</h1>
+    <p class="subtitle">Download books from NDK as searchable PDF or EPUB</p>
+
+    <!-- Auth card -->
+    <div class="card">
+      <h2>Authentication <span id="authBadge" class="auth-status"><span class="dot"></span>not connected</span></h2>
+      <div class="auth-row">
+        <div class="field">
+          <label>JSESSIONID</label>
+          <input id="jsessionid" placeholder="e.g. ABC123DEF456..." />
+        </div>
+        <div class="field">
+          <label>Shibsession</label>
+          <input id="shibsession" placeholder="_shibsession_6e64...=VALUE" />
+        </div>
+      </div>
+<div class="field" style="margin-top:10px; display:flex; align-items:center; gap:8px; flex-wrap:wrap">
+        <button class="btn btn-primary" style="width:auto; padding:8px 20px; font-size:13px" onclick="authenticate()">Connect</button>
+        <button class="btn" style="width:auto; padding:8px 16px; font-size:13px; background:#f0f0f0; color:#555; border:1px solid #ddd" onclick="window.open('https://ndk.cz/Shibboleth.sso/Login?target=https://ndk.cz/search/','_blank')">Login via eduID</button>
+        <span class="hint">Copy cookies from DevTools &gt; Application &gt; Cookies &gt; ndk.cz</span>
+      </div>
+    </div>
+
+    <!-- Book card -->
+    <div class="card">
+      <h2>Book</h2>
+      <div class="field">
+        <label>NDK Book Link or UUID</label>
+        <input id="bookLink" placeholder="https://ndk.cz/view/uuid:726f8730-c0a7-11e3-aec3-005056827e52 or uuid:..." />
+        <div class="hint">Paste the full URL from ndk.cz or just the uuid:... identifier</div>
+      </div>
+    </div>
+
+    <!-- Format & Download card -->
+    <div class="card">
+      <h2>Output Format</h2>
+      <div class="format-row" id="formatRow">
+        <div class="format-option selected" data-format="pdf" onclick="selectFormat(this)">
+          <div class="fmt-name">PDF</div>
+          <div class="fmt-desc">Searchable PDF with OCR text layer</div>
+        </div>
+        <div class="format-option" data-format="epub" onclick="selectFormat(this)">
+          <div class="fmt-name">EPUB</div>
+          <div class="fmt-desc">E-book format, text only</div>
+        </div>
+      </div>
+
+      <div style="margin-top:16px">
+        <div class="field">
+          <label>Page Range (optional)</label>
+          <input id="pageRange" placeholder="e.g. 1-10 or leave empty for all pages" />
+        </div>
+      </div>
+
+      <button class="btn btn-primary" id="btnConvert" onclick="startConversion()" style="margin-top:16px">
+        Convert &amp; Download
+      </button>
+
+      <div class="status-area" id="statusArea">
+        <div class="progress-track"><div class="progress-fill" id="progressFill"></div></div>
+        <div class="status-text" id="statusText">Preparing...</div>
+      </div>
+    </div>
+
+    <div class="footer">
+      <a href="/debug">Open Debug Interface</a>
+    </div>
+  </div>
+
+  <script>
+    let selectedFormat = 'pdf';
+    let pollTimer = null;
+
+    function selectFormat(el) {
+      document.querySelectorAll('.format-option').forEach(o => o.classList.remove('selected'));
+      el.classList.add('selected');
+      selectedFormat = el.dataset.format;
+    }
+
+    function extractUuid(input) {
+      input = input.trim();
+      // Try to extract uuid from URL like https://ndk.cz/view/uuid:xxx or uuid:xxx
+      const match = input.match(/(uuid:[a-f0-9-]+)/i);
+      return match ? match[1] : input;
+    }
+
+    async function authenticate() {
+      const jsessionid = document.getElementById('jsessionid').value.trim();
+      const shibsession = document.getElementById('shibsession').value.trim();
+
+      if (!jsessionid) { alert('Please enter JSESSIONID'); return; }
+
+      let cookie = `JSESSIONID=${jsessionid}`;
+      if (shibsession) {
+        // Accept either "NAME=VALUE" or just "VALUE" (prefixed with _shibsession_=)
+        cookie += `; ${shibsession.includes('=') ? shibsession : '_shibsession_=' + shibsession}`;
+      }
+
+      try {
+        await fetch('/auth/set-cookie', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cookie }),
+        });
+
+        const resp = await fetch('/auth/status');
+        const data = await resp.json();
+        const badge = document.getElementById('authBadge');
+
+        if (data.user && data.user.lname && data.user.lname !== 'not_logged') {
+          badge.className = 'auth-status ok';
+          badge.innerHTML = `<span class="dot"></span>${data.user.firstname} ${data.user.surname}`;
+        } else {
+          badge.className = 'auth-status';
+          badge.innerHTML = '<span class="dot"></span>cookie set, not verified';
+        }
+      } catch (e) {
+        alert('Connection error: ' + e.message);
+      }
+    }
+
+    async function startConversion() {
+      const bookInput = document.getElementById('bookLink').value.trim();
+      if (!bookInput) { alert('Please enter a book link or UUID'); return; }
+
+      const uuid = extractUuid(bookInput);
+      const pageRange = document.getElementById('pageRange').value.trim();
+      const btn = document.getElementById('btnConvert');
+      const statusArea = document.getElementById('statusArea');
+      const statusText = document.getElementById('statusText');
+      const progressFill = document.getElementById('progressFill');
+
+      btn.disabled = true;
+      statusArea.classList.add('visible');
+      statusText.className = 'status-text';
+      statusText.textContent = 'Starting conversion...';
+      progressFill.style.width = '0%';
+
+      try {
+        const resp = await fetch('/api/ocr/start', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ uuid, format: selectedFormat, pages: pageRange }),
+        });
+        const data = await resp.json();
+        if (data.error) {
+          statusText.textContent = data.error;
+          statusText.className = 'status-text error';
+          btn.disabled = false;
+          return;
+        }
+
+        // Poll for progress
+        pollTimer = setInterval(async () => {
+          try {
+            const sr = await fetch('/api/ocr/status');
+            const s = await sr.json();
+            progressFill.style.width = s.progress + '%';
+            statusText.textContent = s.message || 'Processing...';
+
+            if (s.status === 'done') {
+              clearInterval(pollTimer);
+              statusText.textContent = 'Done! Downloading...';
+              statusText.className = 'status-text done';
+              btn.disabled = false;
+              // Trigger download
+              window.location.href = `/api/ocr/download/${selectedFormat}`;
+            } else if (s.status === 'error') {
+              clearInterval(pollTimer);
+              statusText.textContent = s.message || 'Error during conversion';
+              statusText.className = 'status-text error';
+              btn.disabled = false;
+            }
+          } catch (e) {
+            clearInterval(pollTimer);
+            statusText.textContent = 'Lost connection';
+            statusText.className = 'status-text error';
+            btn.disabled = false;
+          }
+        }, 1000);
+
+      } catch (e) {
+        statusText.textContent = 'Error: ' + e.message;
+        statusText.className = 'status-text error';
+        btn.disabled = false;
+      }
+    }
+
+    // Check auth on load
+    (async () => {
+      try {
+        const resp = await fetch('/auth/status');
+        const data = await resp.json();
+        const badge = document.getElementById('authBadge');
+        if (data.user && data.user.lname && data.user.lname !== 'not_logged') {
+          badge.className = 'auth-status ok';
+          badge.innerHTML = `<span class="dot"></span>${data.user.firstname} ${data.user.surname}`;
+        }
+      } catch (e) {}
+    })();
+  </script>
+</body>
+</html>

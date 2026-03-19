@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kramerius Image Debug</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Courier New', monospace; background: #1a1a2e; color: #e0e0e0; height: 100vh; display: flex; flex-direction: column; }
+
+    header {
+      background: #16213e; padding: 10px 20px; border-bottom: 1px solid #0f3460;
+      display: flex; align-items: center; gap: 16px;
+    }
+    header h1 { font-size: 16px; color: #e94560; white-space: nowrap; }
+
+    .toolbar {
+      display: flex; gap: 8px; align-items: center; flex-wrap: wrap; flex: 1;
+    }
+    label { font-size: 11px; color: #888; }
+    input, select {
+      background: #0f3460; border: 1px solid #533483; color: #e0e0e0;
+      padding: 5px 8px; border-radius: 4px; font-family: inherit; font-size: 12px;
+    }
+    input:focus, select:focus { outline: none; border-color: #e94560; }
+    button {
+      background: #e94560; border: none; color: #fff; padding: 5px 12px;
+      border-radius: 4px; cursor: pointer; font-family: inherit; font-size: 12px;
+    }
+    button:hover { background: #c73652; }
+    button:disabled { opacity: 0.5; cursor: not-allowed; }
+    button.secondary { background: #533483; }
+    button.secondary:hover { background: #6a45a0; }
+    button.success { background: #2d8659; }
+    button.success:hover { background: #1a6b43; }
+
+    .main { display: flex; flex: 1; overflow: hidden; }
+
+    /* --- Log panel --- */
+    .log-panel {
+      flex: 1; overflow-y: auto; padding: 12px; font-size: 12px; line-height: 1.6;
+    }
+    .log-entry { padding: 2px 0; border-bottom: 1px solid #16213e; }
+    .log-entry.error { color: #e94560; }
+    .log-entry.success { color: #4ecca3; }
+    .log-entry.info { color: #7ec8e3; }
+    .log-entry.warn { color: #f5a623; }
+    .log-time { color: #555; margin-right: 8px; }
+
+    /* --- Side panel --- */
+    .side-panel {
+      width: 440px; min-width: 440px; background: #16213e; border-left: 1px solid #0f3460;
+      display: flex; flex-direction: column; overflow: hidden;
+    }
+    .side-header {
+      padding: 8px 14px; font-size: 13px; font-weight: bold; color: #e94560;
+      border-bottom: 1px solid #0f3460; display: flex; justify-content: space-between;
+    }
+    .side-header span { color: #888; font-weight: normal; }
+
+    /* --- Auth panel --- */
+    .auth-panel {
+      padding: 14px; border-bottom: 1px solid #0f3460; background: #131b30;
+    }
+    .auth-panel h3 { font-size: 13px; color: #e94560; margin-bottom: 10px; }
+    .auth-status-bar {
+      display: flex; align-items: center; gap: 10px; margin-bottom: 10px;
+    }
+    .auth-dot {
+      width: 10px; height: 10px; border-radius: 50%; flex-shrink: 0;
+    }
+    .auth-dot.off { background: #e94560; }
+    .auth-dot.on { background: #4ecca3; }
+    .auth-dot.checking { background: #f5a623; animation: pulse 1s infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.4; } }
+    .auth-user { font-size: 12px; flex: 1; }
+    .auth-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+
+    /* --- Login steps --- */
+    .login-steps {
+      margin-top: 12px; padding: 10px; background: #0f1a2e; border-radius: 6px;
+      border: 1px solid #0f3460; font-size: 11px; line-height: 1.8;
+    }
+    .login-steps .step {
+      display: flex; gap: 8px; align-items: flex-start; margin-bottom: 6px;
+    }
+    .login-steps .step-num {
+      background: #e94560; color: #fff; width: 18px; height: 18px; border-radius: 50%;
+      display: flex; align-items: center; justify-content: center; font-size: 10px;
+      font-weight: bold; flex-shrink: 0; margin-top: 2px;
+    }
+    .login-steps .step-num.done { background: #4ecca3; }
+    .login-steps .step-text { flex: 1; }
+    .login-steps code {
+      background: #0f3460; padding: 2px 6px; border-radius: 3px; font-size: 11px;
+      user-select: all; cursor: pointer; color: #f5a623;
+    }
+    .login-steps .hint { color: #666; font-size: 10px; }
+
+    /* --- Cookie input row --- */
+    .cookie-row {
+      display: flex; gap: 6px; margin-top: 8px; align-items: center;
+    }
+    .cookie-row input {
+      flex: 1; font-size: 11px; padding: 6px 8px;
+    }
+
+    /* --- Image cards --- */
+    .image-list { flex: 1; overflow-y: auto; padding: 8px; }
+    .progress-bar { height: 3px; background: #0f3460; margin: 0 14px 8px; }
+    .progress-bar-fill { height: 100%; background: #e94560; transition: width 0.3s; }
+
+    .image-card {
+      background: #1a1a2e; border: 1px solid #0f3460; border-radius: 6px;
+      margin-bottom: 8px; overflow: hidden;
+    }
+    .image-card-header {
+      padding: 6px 10px; font-size: 11px; display: flex; justify-content: space-between;
+      align-items: center; border-bottom: 1px solid #0f3460;
+    }
+    .image-card-header .pid { color: #7ec8e3; font-size: 10px; }
+    .image-card-header .page-label { color: #f5a623; font-weight: bold; }
+    .image-card-body { position: relative; min-height: 60px; background: #111; }
+    .image-card-body img { width: 100%; display: block; }
+    .image-card-body .status-overlay {
+      position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 12px; color: #e94560; background: rgba(0,0,0,0.7);
+    }
+    .status-badge {
+      display: inline-block; padding: 2px 8px; border-radius: 3px; font-size: 10px;
+      font-weight: bold;
+    }
+    .status-badge.ok { background: #1a3a2a; color: #4ecca3; }
+    .status-badge.fail { background: #3a1a1a; color: #e94560; }
+    .status-badge.loading { background: #1a2a3a; color: #7ec8e3; }
+
+    .image-card-streams {
+      padding: 4px 10px; font-size: 10px; display: flex; gap: 6px; flex-wrap: wrap;
+    }
+    .stream-chip {
+      padding: 2px 6px; border-radius: 3px; background: #0f3460; color: #7ec8e3;
+      cursor: pointer;
+    }
+    .stream-chip:hover { background: #533483; }
+    .stream-chip.active { background: #e94560; color: #fff; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>KRAMERIUS DEBUG</h1>
+    <div class="toolbar">
+      <div>
+        <label>Document UUID</label><br>
+        <input id="docUuid" value="uuid:726f8730-c0a7-11e3-aec3-005056827e52" style="width:370px" />
+      </div>
+      <div>
+        <label>Stream</label><br>
+        <select id="streamSelect">
+          <option value="thumb">thumb (no auth)</option>
+          <option value="preview">preview</option>
+          <option value="full" selected>full (IMG_FULL)</option>
+          <option value="iiif">IIIF</option>
+        </select>
+      </div>
+      <div>
+        <label>Pages</label><br>
+        <input id="pageRange" value="1-10" style="width:80px" />
+      </div>
+      <button id="btnFetch" onclick="startDebug()">Fetch Pages</button>
+    </div>
+  </header>
+
+  <div class="main">
+    <div class="log-panel" id="logPanel"></div>
+
+    <div class="side-panel">
+      <!-- Auth section -->
+      <div class="auth-panel">
+        <h3>eduID Authentication</h3>
+        <div class="auth-status-bar">
+          <div class="auth-dot off" id="authDot"></div>
+          <div class="auth-user" id="authUser">Not authenticated</div>
+        </div>
+
+        <div class="auth-actions" id="authActions">
+          <button class="success" onclick="openEduIdLogin()">Login via eduID</button>
+          <button class="secondary" onclick="checkAuthStatus()">Check Status</button>
+        </div>
+
+        <!-- Login guide (hidden by default, shown when login initiated) -->
+        <div class="login-steps" id="loginGuide" style="display:none">
+          <div class="step">
+            <div class="step-num" id="step1Num">1</div>
+            <div class="step-text">
+              A new tab opened with ndk.cz login.<br>
+              Complete the eduID login there.
+              <div class="hint">Select your institution, enter credentials.</div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num" id="step2Num">2</div>
+            <div class="step-text">
+              After login, open <b>DevTools</b> on the ndk.cz tab:<br>
+              <code>Cmd+Option+I</code> (Mac) or <code>F12</code> (Win)
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num" id="step3Num">3</div>
+            <div class="step-text">
+              Go to <b>Application</b> tab &rarr; <b>Cookies</b> &rarr; <code>https://ndk.cz</code><br>
+              <div class="hint">
+                The session cookies are HttpOnly (invisible to document.cookie).<br>
+                You must copy them from the Application tab.
+              </div>
+            </div>
+          </div>
+          <div class="step">
+            <div class="step-num" id="step4Num">4</div>
+            <div class="step-text">
+              Find <b>JSESSIONID</b> and copy its <b>Value</b>.<br>
+              Also copy any <code>_shibsession_*</code> cookie values.<br>
+              Paste below as: <code>JSESSIONID=VALUE; _shibsession_xxx=VALUE</code>
+              <div class="hint">Or use the Network tab: pick any request to ndk.cz, copy the full Cookie header from Request Headers.</div>
+            </div>
+          </div>
+          <div class="cookie-row">
+            <input id="cookieInput" placeholder="JSESSIONID=ABC123; _shibsession_xxx=..." />
+            <button onclick="setCookieFromInput()">Set Cookie</button>
+          </div>
+        </div>
+
+        <!-- Authenticated state -->
+        <div id="authLoggedIn" style="display:none; margin-top:8px;">
+          <div class="cookie-row">
+            <input id="cookieDisplay" readonly style="color:#4ecca3;font-size:10px" />
+            <button class="secondary" onclick="logout()" style="font-size:11px">Logout</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Images section -->
+      <div class="side-header">
+        Image Preview
+        <span id="imageCount">0 images</span>
+      </div>
+      <div class="progress-bar"><div class="progress-bar-fill" id="progressBar" style="width:0%"></div></div>
+      <div class="image-list" id="imageList"></div>
+    </div>
+  </div>
+
+  <script>
+    const IS_PROXIED = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+    const ORIGIN = IS_PROXIED ? '' : 'https://ndk.cz';
+    const API_BASE = `${ORIGIN}/search/api/v5.0`;
+    const IIIF_BASE = `${ORIGIN}/search/iiif`;
+
+    // ---- Logging ----
+    function log(msg, level = 'info') {
+      const panel = document.getElementById('logPanel');
+      const entry = document.createElement('div');
+      entry.className = `log-entry ${level}`;
+      const time = new Date().toLocaleTimeString('en-GB', { hour12: false });
+      entry.innerHTML = `<span class="log-time">${time}</span>${esc(msg)}`;
+      panel.appendChild(entry);
+      panel.scrollTop = panel.scrollHeight;
+    }
+    function esc(s) {
+      return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    // ---- Auth flow ----
+    let loginWindow = null;
+
+    function openEduIdLogin() {
+      // Open ndk.cz Shibboleth login in a new tab
+      const loginUrl = 'https://ndk.cz/Shibboleth.sso/Login?target=https://ndk.cz/search/';
+      loginWindow = window.open(loginUrl, '_blank');
+      log('Opened eduID login in new tab', 'info');
+      log('After login: DevTools > Application > Cookies > ndk.cz > copy JSESSIONID', 'info');
+
+      // Show the guide
+      document.getElementById('loginGuide').style.display = 'block';
+    }
+
+    async function setCookieFromInput() {
+      const raw = document.getElementById('cookieInput').value.trim();
+      if (!raw) {
+        log('No cookie value entered', 'error');
+        return;
+      }
+
+      log('Setting session cookie...', 'info');
+
+      try {
+        const resp = await fetch('/auth/set-cookie', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ cookie: raw }),
+        });
+        const data = await resp.json();
+        if (data.ok) {
+          log('Cookie stored in proxy', 'success');
+          await checkAuthStatus();
+        }
+      } catch (e) {
+        log(`Failed to set cookie: ${e.message}`, 'error');
+      }
+    }
+
+    async function checkAuthStatus() {
+      const dot = document.getElementById('authDot');
+      const userEl = document.getElementById('authUser');
+      dot.className = 'auth-dot checking';
+      userEl.textContent = 'Checking...';
+      log('Checking auth status via proxy...', 'info');
+
+      try {
+        const resp = await fetch('/auth/status');
+        const data = await resp.json();
+
+        if (data.user && data.user.lname && data.user.lname !== 'not_logged') {
+          // Authenticated!
+          dot.className = 'auth-dot on';
+          const name = `${data.user.firstname} ${data.user.surname}`;
+          userEl.textContent = `Logged in: ${name}`;
+          log(`Authenticated as: ${name} (${data.user.lname})`, 'success');
+          if (data.user.labels && data.user.labels.length) {
+            log(`  Labels: ${data.user.labels.join(', ')}`, 'info');
+          }
+          if (data.user.roles) {
+            log(`  Roles: ${data.user.roles.map(r => r.name).join(', ')}`, 'info');
+          }
+
+          // Update UI
+          document.getElementById('loginGuide').style.display = 'none';
+          document.getElementById('authLoggedIn').style.display = 'block';
+          document.getElementById('cookieDisplay').value = data.cookie_preview || '(stored)';
+
+          // Update login button
+          document.getElementById('authActions').innerHTML = `
+            <button class="secondary" onclick="checkAuthStatus()">Refresh</button>
+          `;
+        } else {
+          dot.className = 'auth-dot off';
+          userEl.textContent = data.has_cookie
+            ? 'Cookie set but not authenticated (expired?)'
+            : 'Not authenticated';
+          log(data.has_cookie
+            ? 'Cookie present but user is not_logged - cookie may be expired'
+            : 'No session cookie stored', 'warn');
+
+          document.getElementById('authLoggedIn').style.display = 'none';
+          document.getElementById('authActions').innerHTML = `
+            <button class="success" onclick="openEduIdLogin()">Login via eduID</button>
+            <button class="secondary" onclick="checkAuthStatus()">Check Status</button>
+          `;
+        }
+      } catch (e) {
+        dot.className = 'auth-dot off';
+        userEl.textContent = 'Error checking auth';
+        log(`Auth check error: ${e.message}`, 'error');
+      }
+    }
+
+    async function logout() {
+      try {
+        await fetch('/auth/clear');
+        log('Session cleared', 'info');
+      } catch (e) {
+        log(`Logout error: ${e.message}`, 'error');
+      }
+      document.getElementById('authDot').className = 'auth-dot off';
+      document.getElementById('authUser').textContent = 'Not authenticated';
+      document.getElementById('authLoggedIn').style.display = 'none';
+      document.getElementById('loginGuide').style.display = 'none';
+      document.getElementById('authActions').innerHTML = `
+        <button class="success" onclick="openEduIdLogin()">Login via eduID</button>
+        <button class="secondary" onclick="checkAuthStatus()">Check Status</button>
+      `;
+    }
+
+    // ---- API fetch (uses proxy's stored cookie automatically) ----
+    async function apiFetch(url, opts = {}) {
+      const fetchOpts = {
+        ...opts,
+        credentials: 'same-origin',
+        mode: 'same-origin',
+      };
+      return fetch(url, fetchOpts);
+    }
+
+    // ---- Image URLs ----
+    function imageUrl(pid, stream) {
+      switch (stream) {
+        case 'thumb':   return `${API_BASE}/item/${pid}/thumb`;
+        case 'preview': return `${API_BASE}/item/${pid}/preview`;
+        case 'full':    return `${API_BASE}/item/${pid}/full`;
+        case 'iiif':    return `${IIIF_BASE}/${pid}/full/max/0/default.jpg`;
+        default:        return `${API_BASE}/item/${pid}/thumb`;
+      }
+    }
+
+    // ---- Parse range ----
+    function parseRange(rangeStr, max) {
+      const indices = new Set();
+      for (const part of rangeStr.split(',')) {
+        const trimmed = part.trim();
+        if (trimmed.includes('-')) {
+          const [a, b] = trimmed.split('-').map(Number);
+          for (let i = a; i <= Math.min(b, max); i++) indices.add(i);
+        } else {
+          const n = Number(trimmed);
+          if (n >= 1 && n <= max) indices.add(n);
+        }
+      }
+      return [...indices].sort((a, b) => a - b);
+    }
+
+    // ---- Main fetch flow ----
+    async function startDebug() {
+      const docUuid = document.getElementById('docUuid').value.trim();
+      const stream = document.getElementById('streamSelect').value;
+      const rangeStr = document.getElementById('pageRange').value.trim();
+      const btn = document.getElementById('btnFetch');
+      btn.disabled = true;
+
+      document.getElementById('imageList').innerHTML = '';
+      document.getElementById('progressBar').style.width = '0%';
+      document.getElementById('imageCount').textContent = '0 images';
+
+      log(`=== Fetching ${docUuid} | stream=${stream} | pages=${rangeStr} ===`, 'info');
+
+      // Fetch metadata
+      log('Fetching document metadata...');
+      try {
+        const metaResp = await apiFetch(`${API_BASE}/item/${docUuid}`);
+        if (!metaResp.ok) {
+          log(`Metadata failed: HTTP ${metaResp.status}`, 'error');
+          btn.disabled = false;
+          return;
+        }
+        const meta = await metaResp.json();
+        log(`"${meta.title}" | ${meta.model} | policy: ${meta.policy}`, 'success');
+        if (meta.policy === 'private') {
+          log('PRIVATE document - full images require eduID auth', 'warn');
+        }
+      } catch (e) {
+        log(`Metadata error: ${e.message}`, 'error');
+        btn.disabled = false;
+        return;
+      }
+
+      // Fetch pages
+      log('Fetching page list...');
+      let pages;
+      try {
+        const childResp = await apiFetch(`${API_BASE}/item/${docUuid}/children`);
+        if (!childResp.ok) {
+          log(`Children failed: HTTP ${childResp.status}`, 'error');
+          btn.disabled = false;
+          return;
+        }
+        pages = await childResp.json();
+        log(`${pages.length} pages found`, 'success');
+      } catch (e) {
+        log(`Children error: ${e.message}`, 'error');
+        btn.disabled = false;
+        return;
+      }
+
+      const indices = parseRange(rangeStr, pages.length);
+      log(`Loading ${indices.length} pages...`, 'info');
+
+      const imageList = document.getElementById('imageList');
+      let loaded = 0, failed = 0;
+
+      for (let idx = 0; idx < indices.length; idx++) {
+        const pageIdx = indices[idx] - 1;
+        const page = pages[pageIdx];
+        if (!page) { log(`Page ${indices[idx]} out of bounds`, 'error'); continue; }
+
+        const pid = page.pid;
+        const label = page.title || `Page ${indices[idx]}`;
+        const url = imageUrl(pid, stream);
+
+        log(`[${idx+1}/${indices.length}] ${label} (${pid})`);
+
+        const card = document.createElement('div');
+        card.className = 'image-card';
+        card.innerHTML = `
+          <div class="image-card-header">
+            <span class="page-label">${esc(label)}</span>
+            <span class="pid">${esc(pid)}</span>
+          </div>
+          <div class="image-card-body" id="body-${CSS.escape(pid)}">
+            <div class="status-overlay"><span class="status-badge loading">loading...</span></div>
+          </div>
+          <div class="image-card-streams">
+            ${['thumb','preview','full','iiif'].map(s =>
+              `<span class="stream-chip ${s === stream ? 'active' : ''}"
+                    onclick="reloadImage('${pid}','${s}',this)">${s}</span>`
+            ).join('')}
+          </div>
+        `;
+        imageList.appendChild(card);
+
+        const body = document.getElementById(`body-${CSS.escape(pid)}`);
+        try {
+          const resp = await fetch(url, { method: 'HEAD' });
+          if (resp.ok) {
+            const ct = resp.headers.get('content-type') || '';
+            const cl = resp.headers.get('content-length');
+            const info = `${ct}${cl ? ' ' + (cl/1024).toFixed(1) + 'KB' : ''}`;
+
+            // Load via fetch+blob so proxy cookie is used
+            try {
+              const imgResp = await fetch(url);
+              const blob = await imgResp.blob();
+              const blobUrl = URL.createObjectURL(blob);
+              body.innerHTML = `<img src="${blobUrl}" alt="${esc(label)}" />`;
+            } catch (imgErr) {
+              body.innerHTML = `<img src="${url}" alt="${esc(label)}" />`;
+            }
+            log(`  OK (${info})`, 'success');
+            loaded++;
+          } else {
+            body.innerHTML = `<div class="status-overlay"><span class="status-badge fail">HTTP ${resp.status}</span></div>`;
+            log(`  FAIL HTTP ${resp.status}`, 'error');
+            failed++;
+          }
+        } catch (e) {
+          body.innerHTML = `<div class="status-overlay"><span class="status-badge fail">${esc(e.message)}</span></div>`;
+          log(`  ERROR: ${e.message}`, 'error');
+          failed++;
+        }
+
+        const pct = ((idx + 1) / indices.length * 100).toFixed(0);
+        document.getElementById('progressBar').style.width = `${pct}%`;
+        document.getElementById('imageCount').textContent = `${loaded} ok / ${failed} fail / ${indices.length} total`;
+      }
+
+      log(`=== Done: ${loaded} loaded, ${failed} failed ===`, failed === 0 ? 'success' : 'warn');
+      btn.disabled = false;
+    }
+
+    // ---- Reload single image ----
+    async function reloadImage(pid, stream, chip) {
+      const card = chip.closest('.image-card');
+      card.querySelectorAll('.stream-chip').forEach(c => c.classList.remove('active'));
+      chip.classList.add('active');
+
+      const body = card.querySelector('.image-card-body');
+      body.innerHTML = '<div class="status-overlay"><span class="status-badge loading">loading...</span></div>';
+
+      const url = imageUrl(pid, stream);
+      log(`Reload ${pid} via ${stream}...`);
+
+      try {
+        const resp = await fetch(url, { method: 'HEAD' });
+        if (resp.ok) {
+          try {
+            const imgResp = await fetch(url);
+            const blob = await imgResp.blob();
+            body.innerHTML = `<img src="${URL.createObjectURL(blob)}" alt="${pid}" />`;
+          } catch (e) {
+            body.innerHTML = `<img src="${url}" alt="${pid}" />`;
+          }
+          const ct = resp.headers.get('content-type') || '';
+          log(`  OK (${ct})`, 'success');
+        } else {
+          body.innerHTML = `<div class="status-overlay"><span class="status-badge fail">HTTP ${resp.status}</span></div>`;
+          log(`  FAIL ${resp.status}`, 'error');
+        }
+      } catch (e) {
+        body.innerHTML = `<div class="status-overlay"><span class="status-badge fail">${esc(e.message)}</span></div>`;
+        log(`  ERROR: ${e.message}`, 'error');
+      }
+    }
+
+    // ---- Init ----
+    log('Kramerius Debug Tool initialized', 'info');
+    if (IS_PROXIED) {
+      log('Running through local proxy - API calls proxied to ndk.cz', 'success');
+      checkAuthStatus();
+    } else {
+      log('Not running through proxy! Start: python3 proxy.py', 'error');
+      log('Direct ndk.cz requests will fail due to CORS', 'error');
+    }
+  </script>
+</body>
+</html>
